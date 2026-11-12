@@ -33,13 +33,24 @@ intrinsics  catalog:    program defaults (or Claude-proposed values for exemplar
             scenegraph: kNN-weighted mean of the neighbors' fitted intrinsics
 The best start by final loss wins.
 
-Rendering + loss
-----------------
-Differentiable SDF ray marching of the posed program in camera space with the shared
-intrinsics.json K, over the hold's crop window -> silhouette, depth, normals.
-  loss = w_iou   * (1 - soft IoU(silhouette, hold mask))
-       + w_normal * (1 - mean cos(rendered normal, bkg_normals.png))   inside the mask
-       + w_depth  * L1(rendered depth, bkg_depth)                      inside the mask
+Rendering, target, loss
+-----------------------
+render  bare wall (bare_wall_depth, every hold inpainted) + SDFs of the holds being
+        fitted, differentiable SDF ray marching with the shared intrinsics.json K
+        -> silhouette, depth, normals
+target  the REAL observations: bkg_depth, bkg_normals.png, hold masks. The bumps of the
+        fitted holds are what the SDFs must explain.
+window  each fitted hold's mask dilated by window_margin_px, MINUS the masks of holds
+        not being fitted. Inside those masks this is equivalent to inpainting them, with
+        no second depth map, and the same rule covers both callers:
+          scenegraph: fitted = on-route holds (with the volumes they're mounted on)
+          catalog:    fitted = the single hold; every neighbor is excluded
+  loss = w_iou    * (1 - soft IoU(silhouette, hold mask))
+       + w_normal * (1 - mean cos(rendered normal, bkg_normals))   in the window
+       + w_depth  * L1(rendered depth, bkg_depth)                  in the window
+       + w_points * mean |SDF(p)|  for p = observed depth inside the hold mask lifted to
+                    3D with K (zero on the surface; no ray marching, and direct 3D
+                    gradients even from a poor init)
        + w_reg    * ||extrinsic residuals||^2
 Accepted when the fit score (IoU / normal agreement) >= hold_fit.min_score.
 Weights, iterations, learning rate and the threshold come from config `hold_fit`.
@@ -93,7 +104,8 @@ def fit_hold(program, frame: HoldFrame, starts: list[FitParams], observations: d
              K: np.ndarray, config: dict) -> FitResult:
     """
     program:      the cluster's procedural SDF program (from parametric_holds.py)
-    observations: {"mask", "normals", "depth", "window"} cropped to the hold
+    observations: {"mask", "normals", "depth", "bare_depth", "window", "points"} cropped
+                  to the hold; window already excludes holds not being fitted
     """
     # TODO: implement differentiable SDF ray marching + optimization (torch)
     raise NotImplementedError

@@ -60,7 +60,8 @@ hold_catalog:
 
 hold_fit:                        # common/hold_fit.py — shared by catalog + scenegraph
   min_score: 0.80                # accept threshold (IoU / normal agreement)
-  loss_weights: {iou: 1.0, normal: 1.0, depth: 0.5, reg: 0.1}
+  loss_weights: {iou: 1.0, normal: 1.0, depth: 0.5, points: 1.0, reg: 0.1}
+  window_margin_px: 8            # loss window = dilated hold mask minus non-fitted holds
   iterations: 300
   lr: 0.01
 

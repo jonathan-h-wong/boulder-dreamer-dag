@@ -4,15 +4,17 @@ the catalog (common/hold_fit.py), so parameters are directly comparable.
 
 Steps:
 1. Load hold_descriptions.csv + hold_contacts.csv (on_route, mounted_on), hold_crops,
-   hold_frames.json, bkg_depth.png, bkg_normals.png, intrinsics.json from S3
+   hold_frames.json, bkg_depth.png, bare_wall_depth.npy, bkg_normals.png,
+   intrinsics.json from S3
 2. Load embeddings.npy + knn_labels.parquet + parametric_holds.py from hold_catalog/
 3. For each on-route hold:
    a. Same embedding construction as the catalog -> kNN -> cluster + program;
       intrinsics init = distance-weighted mean of the neighbors' fitted intrinsics
    b. Extrinsics init from this video's own hold frame (never from neighbors):
       theta multi-start by symmetry, tilt 0, offset 0
-   c. hold_fit.fit_hold: differentiable SDF ray marching, supervised by the hold mask,
-      bkg_normals.png and bkg_depth inside the mask
+   c. hold_fit.fit_hold: render bare_wall_depth + on-route hold SDFs, supervised by the
+      real bkg_depth / bkg_normals.png / masks and the lifted 3D points, in a window
+      that excludes untouched holds
 4. Export scenegraph.json (per hold: hold_id, cluster, program, frame, extrinsics,
    intrinsics, score) to processed/{video_id}/output/scenegraph.json
 """

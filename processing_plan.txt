@@ -112,9 +112,19 @@ thing. Both hash it into their cache keys; changing it invalidates both together
     neighbors, since setters mount the same hold at any rotation.
   - Intrinsics (fitted): shape program parameters. Catalog: program defaults / Claude's
     proposal; scenegraph: kNN-weighted mean of the neighbors' fitted intrinsics.
-  - Render: differentiable SDF ray marching with the shared K -> silhouette, depth,
-    normals. Loss: soft IoU vs mask + normal agreement vs bkg_normals.png + depth vs
-    bkg_depth inside the mask + extrinsic regularizer. Accept at hold_fit.min_score.
+  - Render: bare wall (bare_wall_depth, all holds inpainted) + the SDFs of the holds
+    being fitted, via differentiable SDF ray marching with the shared K -> silhouette,
+    depth, normals.
+  - Target: the REAL observations (bkg_depth, bkg_normals.png, hold masks), so the bumps
+    of the holds being fitted are what the SDFs must explain.
+  - Loss window: each fitted hold's mask dilated by a margin, MINUS the masks of holds
+    not being fitted (inside those masks this equals inpainting them, but needs no
+    second depth map). Scenegraph: fitted = on-route holds (incl. volumes they're mounted
+    on); catalog: fitted = the one hold, every neighbor excluded. One rule for both.
+  - Loss: soft IoU vs mask + normal agreement + depth L1 (ray-marched renders, in the
+    window) + 3D point term: observed depth inside the hold mask lifted to 3D with K,
+    penalize |SDF(p)| (zero on the surface; no ray marching, direct 3D gradients even
+    from a poor init) + extrinsic regularizer. Accept at hold_fit.min_score.
   Fixing the frame from real wall geometry leaves the fit with only small extrinsic
   residuals, which makes shape fits better conditioned than solving wall tilt from crops.
 
@@ -149,7 +159,7 @@ processed/
       |-- hold_crops/{rgb, normal, segmentation}
 
     |-- input/
-      |-- wall_mesh.glb (or some other 3D format)
+      |-- wall_mesh.glb (or some other 3D format; clean wall, every hold inpainted)
     |-- output/
       |-- scenegraph.json (custom json format)
       |-- poses.npy
@@ -252,8 +262,9 @@ outputs coordinates. On-route is computed from geometry, not judged from an imag
     - Hold frames (fitting init, see "Shared fitting procedure" in section 2):
       origin/normal/tangent per hold -> holds/hold_frames.json. Holds with mounted_on
       take their plane from the volume's own depth, not the bare wall.
-    - Input mesh: linearly interpolate depth of untouched holds (on_route False in
-      hold_contacts.csv); lift depth, mesh, and export under input/
+    - Input mesh: the clean wall, with no hold bumps: lift bare_wall_depth (every hold,
+      touched and untouched, inpainted), mesh, and export under input/. The bumps stay in
+      bkg_depth / bkg_normals as fitting supervision (see "Shared fitting procedure").
 
 Stage 3: Reconstruction
 Depends on annotated holds, wall_mesh, hold catalog
@@ -263,9 +274,10 @@ Depends on annotated holds, wall_mesh, hold catalog
     this hold's own frame in hold_frames.json.
     - Fit with common/hold_fit.py, the same procedure the catalog uses:
     differentiable SDF ray marching for depth and normals.
-    Supervision:
-    - Normal Map: bkg_normals.png (Marigold V2, from extract_hold_crops), and run linear interpolation on untouched holds
-    - Depth Map: Run linear interpolation on untouched holds
+    Supervision (all real observations, untouched holds excluded from the loss window):
+    - Normal Map: bkg_normals.png (Marigold V2, from extract_hold_crops)
+    - Depth Map: bkg_depth (MoGe-3), rendered against bare wall + on-route hold SDFs
+    - 3D points: observed depth inside each on-route hold's mask, |SDF(p)| -> 0
     - Export optimized scenegraph to output/ (per hold: cluster, program, frame,
       extrinsics, intrinsics, score)
 

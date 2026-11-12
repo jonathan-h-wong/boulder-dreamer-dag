@@ -14,9 +14,10 @@ Steps:
                mounted_on set, plane fit of that volume's own depth instead
      tangent = mask principal axis (2D PCA) projected into the plane
    -> holds/hold_frames.json {hold_id: {origin, normal, tangent, source: wall|volume}}
-3. Input mesh (dataset input): linearly interpolate depth under untouched holds
-   (on_route False), back-project with K, mesh (Delaunay on the image grid)
-   -> input/wall_mesh.glb
+3. Input mesh (dataset input): the clean wall with no hold bumps, i.e. bare_wall_depth
+   back-projected with K and meshed (Delaunay on the image grid) -> input/wall_mesh.glb.
+   The bumps are not lost: bkg_depth / bkg_normals keep them as fitting supervision.
+(hold_contacts.csv is still needed for mounted_on, which picks volume-face frames.)
 """
 
 
