@@ -1,38 +1,70 @@
 pipeline:
-  version: "0.1.0"
+  version: "0.1.0"   # informational (recorded in releases); cache keys track the real lineage
 
 s3:
-  bucket: "boulderdreamer-data"
-  region: "us-east-1"
+  bucket: "boulder-dreamer-dataset"
+  region: "us-east-2"
   prefixes:
+    # Inputs (written by the scraper; read-only to this pipeline)
+    raw_videos: "raw/videos/"            # {post_id}_{item_id}.mp4  -> video_id = file stem
+    raw_metadata: "raw/metadata/"        # {scrape_ts}_{gym_slug}.csv, one row per video_key
+    # Outputs (siblings of raw/ and state/)
     filtered_videos: "filtered_videos/"
     hold_catalog: "hold_catalog/"
     processed: "processed/"
+    manifests: "manifests/"              # immutable dataset releases ({release}.json)
+    batches: "_batches/"                 # in-flight Claude batch records (resume on rerun)
+
+filter:
+  n_frames: 8                    # evenly spaced frames sent to the filter agent
 
 downsampling:
   # Aggressive downsampling for background plate and hold detection
-  hold_catalog_rate: 10          # every Nth frame for catalog bkg extraction
   bkg_plate_rate: 10             # every Nth frame for per-video bkg plate
   depth_rate: 5                  # every Nth frame for depth sampling
   keypose_rate: 1                # full sequence (GVHMR runs on all frames)
 
 models:
-  moge2:
-    checkpoint: "moge-v2-vitl"   # TODO: update with exact HF path
+  # Weights are cached on the Modal volume "boulderdreamer-weights" (see common/modal_images.py)
+  moge3:
+    checkpoint: "Ruicheng/moge-3-vitl"          # HF id; code pinned via MOGE_REF (vitg = larger)
   gvhmr:
-    checkpoint: "gvhmr-base"     # TODO: update with exact path
+    checkpoint_dir: "/weights/gvhmr"            # GVHMR checkpoints, uploaded manually
+    body_models_dir: "/weights/body_models"     # SMPL / SMPL-X (licensed), uploaded manually
   sam2:
-    checkpoint: "sam2_hiera_large.pt"
+    checkpoint: "facebook/sam2.1-hiera-large"   # HF id
   marigold_v2:
-    checkpoint: "prs-eth/marigold-v1-0"  # TODO: update to v2 release
+    repo: "huawei-bayerlab/marigold-v2-0"       # HF id; code pinned via MARIGOLD_V2_REF
+    checkpoint: "normals"                       # camera-space unit normals
+    resolution: 1024                            # 2048 needs a ~32 GB GPU
+
+hold_proposals:                  # SAM2 automatic masks -> numbered set-of-marks overlay
+  points_per_side: 64
+  crop_n_layers: 1               # extra zoomed passes so small footholds survive
+  min_mask_area_px: 150
+  nms_mask_iou: 0.7
+  tile_px: 1024                  # overlay tiles sent to the agent (API downscales big images)
+  tile_overlap_px: 128
+
+hold_contacts:                   # geometric on-route + volume mounting
+  min_contact_frames: 5
+  max_contact_speed_px: 3.0      # per frame, projected hand/foot point
+  wall_depth_tol_m: 0.10
+  mask_dilate_px: 6
+  mount_min_containment: 0.6     # intersection / hold-bbox area (not IoU)
 
 hold_catalog:
   max_farthest_point_samples: 50
   hdbscan_min_cluster_size: 5
   pca_components: 64
-  parametric_fit_min_iou: 0.80
+
+hold_fit:                        # common/hold_fit.py — shared by catalog + scenegraph
+  min_score: 0.80                # accept threshold (IoU / normal agreement)
+  loss_weights: {iou: 1.0, normal: 1.0, depth: 0.5, reg: 0.1}
+  iterations: 300
+  lr: 0.01
 
 agents:
-  model: "claude-opus-4-5"
-  max_tokens: 4096
-  batch_max_concurrent: 50       # Claude batch API concurrency
+  model: "claude-opus-5-5"
+  effort: "medium"               # thinking depth; Opus 5.5 always thinks, effort is the dial
+  max_tokens: 16000              # room for thinking + a full hold list; truncation = failure

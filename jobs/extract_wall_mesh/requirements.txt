@@ -1,5 +1,0 @@
-numpy
-scipy
-trimesh
-open3d
-boto3

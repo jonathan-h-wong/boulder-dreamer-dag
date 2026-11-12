@@ -1,63 +1,58 @@
 """
-Filter Flow — dispatches filter_video agent jobs for a list of raw video IDs.
-Writes passing video IDs to S3 for downstream flows to consume.
+Filter Flow — decides which raw videos enter the dataset.
+
+  1. extract_filter_frames  (Modal .map over all raw videos)
+  2. filter_video           (one Claude batch over all videos with frames + metadata)
+  3. aggregate              -> filtered_videos/passing_video_ids.json
+
+Videos without climber height in raw/metadata/*.csv are rejected up front, without
+spending a Claude request on them.
 """
 
-from prefect import flow, task, get_run_logger
-from prefect.artifacts import create_table_artifact
-import yaml
 import json
-import boto3
+from concurrent.futures import ThreadPoolExecutor
 
-from common.idempotency import is_done, mark_done
-from common.s3 import get_client
-from agents.filter_video.agent import submit_filter_batch, poll_filter_batch
+from prefect import flow, get_run_logger
+from prefect.artifacts import create_table_artifact
 
-
-@task
-def load_config(config_path: str) -> dict:
-    with open(config_path) as f:
-        return yaml.safe_load(f)
-
-
-@task
-def list_raw_videos(client, bucket: str) -> list[str]:
-    """Return video IDs from the raw upload prefix that have not been filtered yet."""
-    # TODO: scan s3://{bucket}/raw_videos/ and return video IDs
-    raise NotImplementedError
-
-
-@task
-def run_filter_agent(video_ids: list[str], config: dict) -> list[dict]:
-    """Submit Claude batch job for video filtering and poll until complete."""
-    batch_id = submit_filter_batch(video_ids, config)
-    return poll_filter_batch(batch_id, config)
-
-
-@task
-def write_filter_results(client, bucket: str, results: list[dict], config: dict):
-    passing = [r["video_id"] for r in results if r["passed"]]
-    key = f"{config['s3']['prefixes']['filtered_videos']}passing_video_ids.json"
-    client.put_object(Bucket=bucket, Key=key, Body=json.dumps(passing).encode())
-    return passing
+from common.s3 import download_bytes
+from common.schemas import VideoFilterResult
+from flows.runtime import (
+    S3_WORKERS, build_context, load_config, publish_report, run_agent_stage, run_modal_stage,
+)
 
 
 @flow(name="filter-videos", log_prints=True)
 def filter_flow(config_path: str = "configs/pipeline.yaml"):
     logger = get_run_logger()
     config = load_config(config_path)
-    client = get_client(config["s3"]["region"])
-    bucket = config["s3"]["bucket"]
+    ctx = build_context(config)
+    logger.info(f"Found {len(ctx.video_ids)} raw videos.")
 
-    video_ids = list_raw_videos(client, bucket)
-    logger.info(f"Found {len(video_ids)} raw videos to filter.")
+    has_metadata = [v for v in ctx.video_ids if ctx.inputs[v]["metadata"] is not None]
+    run_modal_stage(ctx, "extract_filter_frames", has_metadata)
+    run_agent_stage(ctx, "filter_video")
 
-    results = run_filter_agent(video_ids, config)
-    passing = write_filter_results(client, bucket, results, config)
-    logger.info(f"{len(passing)}/{len(video_ids)} videos passed filtering.")
+    prefix = config["s3"]["prefixes"]["filtered_videos"]
 
-    create_table_artifact(
-        key="filter-results",
-        table=results,
-        description="Video filter results",
-    )
+    def result(vid: str) -> dict:
+        if ctx.inputs[vid]["metadata"] is None:
+            return VideoFilterResult(video_id=vid, passed=False, missing_climber_metadata=True,
+                                     notes="no climber height in raw/metadata").model_dump()
+        if vid not in ctx.ok["filter_video"]:
+            return VideoFilterResult(video_id=vid, passed=False,
+                                     notes="not evaluated (failed upstream; rerun to retry)").model_dump()
+        raw = download_bytes(ctx.s3, ctx.bucket, f"{prefix}{vid}/filter_result.json")
+        return json.loads(raw)
+
+    with ThreadPoolExecutor(S3_WORKERS) as pool:
+        results = list(pool.map(result, ctx.video_ids))
+
+    passing = sorted(r["video_id"] for r in results if r["passed"])
+    ctx.s3.put_object(Bucket=ctx.bucket, Key=f"{prefix}passing_video_ids.json",
+                      Body=json.dumps(passing).encode(), ContentType="application/json")
+    logger.info(f"{len(passing)}/{len(results)} videos passed filtering.")
+
+    publish_report(ctx, "filter-stages")
+    create_table_artifact(key="filter-results", table=results, description="Video filter results")
+    return passing

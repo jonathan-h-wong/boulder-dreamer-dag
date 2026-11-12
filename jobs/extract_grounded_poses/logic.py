@@ -1,5 +1,5 @@
 """
-extract_grounded_poses logic — synchronizes GVHMR poses with MoGe-2 depth maps.
+extract_grounded_poses logic — synchronizes GVHMR poses with MoGe-3 depth maps.
 
 Steps:
 1. Load poses.npy (GVHMR output), depth_samples/, and intrinsics/ from S3

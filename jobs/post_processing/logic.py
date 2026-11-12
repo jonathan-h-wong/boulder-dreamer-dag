@@ -2,7 +2,8 @@
 post_processing logic — floor plane fit, coordinate frame normalization, metric scaling.
 
 Steps:
-1. Load wall_mesh.glb, output/poses.npy, scenegraph.json from S3
+1. Load wall_mesh.glb, output/poses.npy, scenegraph.json, climber.json
+   ({"height_cm", "ape_index_cm"}, written by the orchestrator from raw/metadata) from S3
 2. Fit floor plane to wall mesh base vertices (RANSAC plane fit)
 3. Compute gravity-aligned world frame:
    - Floor plane normal -> up axis

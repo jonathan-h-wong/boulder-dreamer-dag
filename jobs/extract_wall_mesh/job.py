@@ -1,17 +1,22 @@
 """extract_wall_mesh — CPU Modal job (depth lifting + wall mesh generation)."""
 
 import modal
-from common.modal_images import cpu_base
 
-app = modal.App("boulderdreamer-extract-wall-mesh")
+from common.modal_images import cpu_geometry
+from common.modal_jobs import app_name
+
+app = modal.App(app_name("extract_wall_mesh"))
 
 
 @app.function(
-    image=cpu_base,
+    image=cpu_geometry,
     secrets=[modal.Secret.from_name("boulderdreamer-secrets")],
     cpu=4,
     timeout=1200,
 )
-def extract_wall_mesh(video_id: str, config: dict):
+def extract_wall_mesh(video_id: str, marker: dict, config: dict):
+    from common.idempotency import write_marker
     from jobs.extract_wall_mesh.logic import run
+
     run(video_id, config)
+    write_marker(marker)  # last step: only reached if outputs were fully written

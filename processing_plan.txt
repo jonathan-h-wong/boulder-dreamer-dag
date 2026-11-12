@@ -1,50 +1,66 @@
-Directories/Scripts, based on steps: 
+Directories/Scripts, based on steps:
 
-1) Video Filtering 
-filtered videos/
+0) Raw inputs (s3://boulder-dreamer-dataset/, written by the scraper; read-only here)
+raw/
+  |-- videos/{post_id}_{item_id}.mp4       video_id = file stem
+  |-- metadata/{scrape_ts}_{gym_slug}.csv  one row per video_key (videos/{video_id}.mp4);
+                                           climber fields used: height_cm, ape_index_cm.
+                                           A later scrape's row for the same video wins.
+state/                                     scraper state; never touched by this pipeline
+All pipeline outputs below are siblings of raw/ and state/ in the same bucket.
 
-- filter_video.py (agentic CPU batch job)
-  - Too many climbers: Downstream video analysis assumes human extraction of a single human. 
+
+1) Video Filtering
+filtered_videos/
+  |-- passing_video_ids.json
+  |-- {video_id}/
+    |-- frames/
+    |-- filter_result.json
+
+- filter_video.py (CPU batch job with sparse agent calls)
+  Videos without height_cm are rejected up front, without a Claude request.
+  extract_filter_frames (Modal, mapped over all videos) samples a handful of frames;
+  filter_video (ONE Claude batch over all remaining videos) judges the criteria below.
+  - Too many climbers: Downstream video analysis assumes human extraction of a single human.
   Inspect downsampled video to check for multiple humans throughout duration of video.
   - Camera Blur: Camera blur introduces noise into downstream depth models and shape analysis.
   Discard videos in which camera is too blurry/goes out of focus.
-  - Moving Camera: Downstream analysis assumes a static camera to retrieve background plate via median filtering. 
-  Discard videos with a moving camera. 
-  - Contains floor plane: Floor plane is necessary to establish a gravity-aligned world frame. 
-  Discard videos that do not contain the floor. 
-  - Climber height metadata: 
-  Discard videos that do not have climber metadata, as this is necessary for metric scaling. 
+  - Moving Camera: Downstream analysis assumes a static camera to retrieve background plate via median filtering.
+  Discard videos with a moving camera.
+  - Contains floor plane: Floor plane is necessary to establish a gravity-aligned world frame.
+  Discard videos that do not contain the floor.
+  - Climber height metadata:
+  Discard videos that do not have climber metadata, as this is necessary for metric scaling.
 
 
 2) Curate Hold Catalog-- route agnostic, global catalog.
-Hold data persists after cataloging in the case of re-embedding.
+No detection pass of its own: the catalog AGGREGATES per-video hold perception
+(section 3, Stage 2: processed/{video_id}/holds/), which already labels every hold
+(on- and off-route) on each clean plate.
+Hold data persists in processed/{video_id}/holds/ in the case of re-embedding.
 hold_catalog/
-  |-- holds/
-    |-- hold_descriptions.csv
-    |-- hold_crops/{rgb, normal, segmentation}
-
   |-- parametric_holds.py
   |-- embeddings.npy
-  |-- knn_labels json/parquet
+  |-- knn_labels.parquet  (video_id, hold_id, cluster_id, fit params)
+  |-- _markers/curate_hold_catalog.json  (cache key + member video_ids + lineage)
 
-In place downsampling + median filtering. Downsampling rate can be quite aggressive:
-Stage 1: Extract Hold Descriptions
-- extract_hold_descriptions.py (CPU agent job, writes crop boundaries)
-  Agent prompt: 
-  'Identify all the climbing holds and volumes in the following image. 
-   Focus on the holds and volumes on closest wall the camera is focusing on. Ignore contents on further walls.
-   Be comprehensive. Detect small footholds, and volumes being occluded by mounted holds. 
-   For each hold or volume, export crop coordinates and schema fields' 
+Runs as a barrier inside the dataset flow, after extract_wall_mesh and before
+extract_scenegraph (which warm-starts from it). The catalog is an explicit snapshot:
+  - First run (no catalog yet): built from every video whose wall mesh (and therefore
+    hold frames, crops, contacts) is current at that point of the run.
+  - Default afterwards: reuse the existing catalog as-is, WITHOUT comparing hashes.
+    Videos added later query it without being in it. (Strict hashing would rebuild the
+    catalog, and rerun every video's scenegraph, every time a video is added.) If the
+    catalog's own code/config has changed since it was built, the flow logs a warning.
+  - rebuild_catalog=True (dataset-flow parameter), or the standalone
+    curate-hold-catalog deployment: recompute the catalog key from the current members +
+    code + config. Same key -> nothing happens. Different key -> rebuild; the new key
+    feeds every scenegraph's key, so scenegraph + post_processing rerun for all videos.
 
-Stage 2: Extract Hold Crops
-- extract_hold_crops.py (GPU batch job)
-  Runs Marigold V2 and SAM2 and extracts {rgb, normal, segmentation} image crops. 
+- curate_hold_catalog (single Modal CPU job + Claude agent run)
+  Runs embedding construction, clustering, authors differentiable parametric holds/volumes,
+  and produces output embedding matrix and knn labels.
 
-Stage 3: Curate Hold Catalog
-- curate_hold_catalog.py (single CPU agent run)
-  Runs embedding construction, clustering, authors differentiable parametric holds/volumes, 
-  and produces output embedding matrix and knn labels. 
-  
 Schema for extract_hold_descriptions:
 Field	        Values
 hold_type	    jug, crimp_edge, rail, sloper, pinch, pocket, horn_knob, foot_chip, volume_pyramid, volume_dome, volume_other, macro_slab, wedge_chip, flake, other
@@ -55,22 +71,54 @@ opening	        none, single_finger, two_finger, three_finger, hand_scoop, slot
 symmetry	    bilateral, radial, none
 relative_size	tiny, small, medium, large, volume
 depth_class	    shallow, medium, deep, very_deep
-free description, limited to two sentences. 
+free description, limited to two sentences.
 
-Embedding construction: 
-Concatenated/Combined in intelligent way: 
+Agent output format (all agent steps):
+Every agent response is constrained to a JSON schema generated from a Pydantic model in
+common/schemas.py (Claude structured outputs: output_config.format, schema from
+anthropic.transform_schema), then re-validated with the same model, which also checks
+limits the API schema can't express (e.g. max length). Truncated or refused responses
+count as failures and are retried on the next run.
+Claude only outputs what it judges; ids, coordinates and derived flags are added in code.
+  - extract_hold_descriptions -> HoldLabelResponse
+      holds: [HoldLabel{mark_ids, hold_type, outline, profile, lip, opening, symmetry,
+              relative_size, depth_class, description}], non_hold_marks: [int]
+  - filter_video -> FilterJudgment
+      {too_many_climbers, camera_blur, moving_camera, no_floor_plane, notes}
+      (passed and missing_climber_metadata are computed in code)
+
+Embedding construction:
+Concatenated/Combined in intelligent way:
 - One hot encoded fields
-- free description encoded with text transformer 
+- free description encoded with text transformer
 - Normal histogram rather than DINO encoding, which I sense is out of distribution here.
 
-Clustering/Export for Querying: 
-- HDBSCAN on PCA of fused vector, which discovers number of clusters. 
+Clustering/Export for Querying:
+- HDBSCAN on PCA of fused vector, which discovers number of clusters.
 For each cluster, sample max of 50 farthest-point samples and feed {RGB, Normal} crops + schema descriptions
-into Claude for procedural program generation. Optimized fit of extrinsic wall tilt 
+into Claude for procedural program generation. Optimized fit of extrinsic wall tilt
 and intrinsic shape parameters should be greater than 80%. Loss is some combination of segmentation IoU and normal alignment.
-With procedural program settled, fit all remaining holds, exporting only the intrinsic parameters. 
+With procedural program settled, fit all remaining holds, exporting only the intrinsic parameters.
 
-After this, will have: 
+Shared fitting procedure (common/hold_fit.py): the catalog and extract_scenegraph fit
+holds with the SAME code, so catalog parameters and scenegraph parameters mean the same
+thing. Both hash it into their cache keys; changing it invalidates both together.
+  - Frame (fixed, from extract_wall_mesh's hold_frames.json): origin = mask centroid on
+    the bare-wall surface; normal = local plane of the bare wall, or of the volume face
+    for holds with mounted_on; tangent = mask principal axis in that plane.
+  - Extrinsics (fitted): small residuals relative to the frame: in-plane rotation theta,
+    2-dof tilt, 3-dof offset. Initialized from this hold's own frame (theta multi-start
+    by symmetry: radial 1, bilateral 2, none 4; tilt 0; offset 0), never from catalog
+    neighbors, since setters mount the same hold at any rotation.
+  - Intrinsics (fitted): shape program parameters. Catalog: program defaults / Claude's
+    proposal; scenegraph: kNN-weighted mean of the neighbors' fitted intrinsics.
+  - Render: differentiable SDF ray marching with the shared K -> silhouette, depth,
+    normals. Loss: soft IoU vs mask + normal agreement vs bkg_normals.png + depth vs
+    bkg_depth inside the mask + extrinsic regularizer. Accept at hold_fit.min_score.
+  Fixing the frame from real wall geometry leaves the fit with only small extrinsic
+  residuals, which makes shape fits better conditioned than solving wall tilt from crops.
+
+After this, will have:
 - Matrix of embedding vectors
 - Corresponding table of class category + associated fit parameters
 A downstream query uses the same embedding construction to fetch the corresponding cluster
@@ -78,18 +126,26 @@ based on weighted distances to nearest neighbors, and warmstarts fit parameters 
 - parametric_holds.py
 
 
-3) Produce dataset-- no need to keep intermediate maps around on S3. 
+3) Produce dataset-- no need to keep intermediate maps around on S3.
 processed/
   |-- {video_id}
     |-- bkg_rbg.png  (or some other img format)
     |-- bkg_depth.png  (or some other img format)
+    |-- bkg_normals.png   (Marigold V2, written by extract_hold_crops, reused by scenegraph)
     |-- depth_samples/
       |-- imgs/
       |-- intrinsics/
+    |-- intrinsics.json   (single static-camera K, median over depth samples)
+    |-- bare_wall_depth.npy (depth with every hold inpainted; written by extract_wall_mesh)
     |-- poses.npy
+    |-- climber.json      (height_cm, ape_index_cm; staged by the orchestrator)
 
     |-- holds/
-      |-- hold_descriptions.csv
+      |-- proposals/{masks.npz, marks.png, marks.json, tiles/}  (SAM2 masks + numbered overlay)
+      |-- hold_labels.json      (agent output, validated)
+      |-- hold_descriptions.csv (one row per hold: hold_id, mark_ids, bbox, schema fields)
+      |-- hold_contacts.csv     (hold_id, on_route, mounted_on, n_contacts, contact_limbs)
+      |-- hold_frames.json      (hold_id -> origin, normal, tangent, source; fitting init)
       |-- hold_crops/{rgb, normal, segmentation}
 
     |-- input/
@@ -98,75 +154,171 @@ processed/
       |-- scenegraph.json (custom json format)
       |-- poses.npy
 
+    |-- _markers/{stage}.json   (cache key + lineage per stage)
 
-Batch script, each worker writes keyframes to processed/:
+
+Stage-major dispatch: each step runs for ALL eligible videos at once (Modal .map for
+jobs, one Claude batch for agent steps) before the next step starts. Independent steps
+run concurrently. A video that fails a step drops out of its downstream steps for that
+run only; rerunning retries just what isn't current.
+
+Order:
+  Stage 1: bkg_plate | depth
+           -> poses (needs depth's intrinsics) | hold_proposals (needs only the plate)
+  Stage 2: hold_descriptions -> hold_crops | hold_contacts | grounded_poses
+           -> wall_mesh (+ bare-wall depth, hold frames)
+  -> hold catalog barrier (section 2; fits with common/hold_fit.py)
+  Stage 3: scenegraph (same hold_fit procedure, warm-started from the catalog)
+  Stage 4: post_processing
+  -> optional release manifest
+
+Each worker writes its outputs to processed/:
 Stage 1: Scene Perception
 All steps here take a downsampling rate.
   - extract_bkg_plate.py: (Batch CPU job)
     - Median filter over specified downsampled rate.
   - extract_depth.py: (Batch GPU job)
-    - MoGe-2 depth model. Outputs depth and intrinsic. Run on specified downsampled rate.
+    - MoGe-3 depth model. Outputs depth and intrinsic. Run on specified downsampled rate.
     - Resolve bkg depth: Median on depth maps for base depth.
-  - extract_poses.py: (Batch GPU job) 
-    - GVHMR model. Run on full video sequence, and subsample output to specified downsampling rate.
+    - Resolve camera intrinsics: the camera is static (enforced by filtering), so take the
+      per-parameter median of MoGe-3's per-frame intrinsics -> one K in intrinsics.json.
+      Every downstream consumer (GVHMR, grounded poses, hold contacts, wall mesh) uses this
+      same K, so pose and depth start in the same camera.
+  - extract_poses.py: (Batch GPU job, after extract_depth)
+    - GVHMR model with known intrinsics (intrinsics.json) instead of its own focal estimate.
+      Run on full video sequence, and subsample output to specified downsampling rate.
+    - Since K is shared, extract_grounded_poses only needs to solve for scale and
+      translation between the GVHMR body and the depth maps.
 
 Stage 2: Hold Perception
-Depends on clean plate, poses.
-Mirrors 'extract hold description, extract hold crops' in hold cataloguing. 
-  Stage 1: 
-  - extract_hold_descriptions.py: (Agentic CPU batch job)
-    Agent prompt: 
-    'Identify all the climbing holds and volumes in the following image. 
-    Focus on the holds and volumes on closest wall the camera is focusing on. Ignore contents on further walls.
-    Be comprehensive. Detect small footholds, and volumes being occluded by mounted holds. 
-    For each hold or volume, export crop coordinates, schema fields, 
-    and also a boolean value the describes whether a hold or volume is on-route, ie.
-    touched by a climber's hands or feet. If a climber touches a hold mounted onto a volume, 
-    the volume is considered to be on-route.' 
-    Pass in the clean plate + poses. 
+Depends on clean plate, intrinsics, poses.
+Also the sole input to the global hold catalog (section 2).
+Localization comes from SAM2 and semantics from Claude ("set-of-marks"); Claude never
+outputs coordinates. On-route is computed from geometry, not judged from an image.
+  Stage 1:
+  - extract_hold_proposals.py: (GPU batch job, alongside extract_poses)
+    - SAM2 automatic mask generation on the clean plate (dense point grid, extra crop
+      layers so small footholds survive). Drop masks below a minimum area, de-duplicate
+      overlapping masks (NMS on mask IoU).
+    - Number every surviving mask and render a set-of-marks overlay: mask contour + mark id
+      at the mask's interior point. Write masks.npz, marks.png, and marks.json
+      (mark_id -> bbox, area, centroid).
+    - Tiling: the API downscales large images (~1.5k px long edge), which loses tiny marks.
+      Split the overlay into overlapping tiles; a mark is drawn in every tile that
+      contains it, and all tiles go in the same request.
+    - Proposal recall is now a SAM2 tuning question (grid density, min area, crop
+      layers); "be comprehensive" moves from the prompt into these parameters.
 
-  Stage 2: 
+  Stage 2:
+  - extract_hold_descriptions.py: (Agentic, ONE Claude batch over all videos)
+    Input: clean plate + numbered overlay tiles. Agent prompt:
+    'Each numbered region is a candidate from an automatic segmenter. Identify which
+    numbered regions are climbing holds or volumes. Focus on the holds and volumes on the
+    closest wall the camera is focusing on; regions on further walls are not holds.
+    Be comprehensive: label small footholds, and volumes partially occluded by mounted holds.
+    If one hold or volume spans several regions, list all of their numbers together.
+    For each hold or volume, fill in the schema fields.'
+    Output: HoldLabelResponse (see "Agent output format"). Code assigns hold_id, unions
+    the marks' masks, and computes bbox from them. Every mark must be listed exactly once
+    (in a hold or in non_hold_marks); otherwise the video fails and is retried.
+
+  Stage 3 (concurrent):
   - extract_hold_crops.py: (GPU batch job)
-    - Run Marigold V2 and SAM2 and extract {rgb, normal, segmentation} image crops. 
+    - Run Marigold V2 (normals checkpoint) once on the clean plate -> bkg_normals.png;
+      crop {rgb, normal, segmentation} per hold using the proposal masks (SAM2 already
+      ran, so no prompting is needed here).
+  - extract_hold_contacts.py: (CPU batch job) -> hold_contacts.csv
+    - Contacts: project GVHMR hand and foot points (SMPL hand/foot vertex regions, not
+      just wrist/ankle joints) into the image with the shared K. A contact is a run of at
+      least N consecutive frames where the point is nearly stationary (speed below a
+      threshold) AND its depth is within a tolerance of the wall depth at that pixel.
+      A contact touches the hold whose (slightly dilated) mask contains the projected point.
+      on_route = touched at least once.
+    - Mounting: a non-volume hold is mounted on a volume when their bounding boxes
+      overlap. Measure overlap / hold-box area (containment), NOT symmetric IoU: a small
+      hold fully on a big volume has a tiny IoU. Threshold is configurable; if a hold
+      overlaps several volumes, take the one with the largest overlap. mounted_on = volume.
+    - A volume is on_route if it is touched directly, or any hold mounted on it is.
 
-Stage 3: Reconstruction
-Depends on annotated holds 
-  - extract_grounded_poses.py: (CPU batch job)
+  Stage 4 (last hold-perception step, right before the catalog barrier):
+  - extract_grounded_poses.py: (CPU batch job; only needs poses + depth, so it runs
+    alongside hold_crops / hold_contacts)
     - Perform best fit of human across all depth maps to synchronize independent NN outputs.
-    Use extracted pose + intrinsics to rasterize human segmentation mask to apply on depth map. CPU rasterization. 
+    Use extracted pose + the shared intrinsics.json to rasterize human segmentation mask to apply on depth map. CPU rasterization.
     - Export under output/
 
-  - extract_wall_mesh.py: (CPU batch job)
-    - Linearly interpolate depth of untouched holds
-    - Lift depth, mesh, and export under input/
-    
-  - extract_scenegraph.py: (GPU batch job) 
-    - Query for touched holds, construct embedding for hold types, 
-    warm start differentiable parametric hold on prefit knn parameters + lifted 3D depth. 
-    
-    Use differentiable SDF ray marching for depth and normals.
-    Supervision: 
-    - Normal Map: Run MarigoldV2 for on-the-fly clean plate normal map, and run linear interpolation on untouched holds
+  - extract_wall_mesh.py: (CPU batch job) — wall geometry shared by catalog + scenegraph
+    - Bare-wall depth: inpaint depth under EVERY hold/volume mask -> bare_wall_depth.npy
+    - Hold frames (fitting init, see "Shared fitting procedure" in section 2):
+      origin/normal/tangent per hold -> holds/hold_frames.json. Holds with mounted_on
+      take their plane from the volume's own depth, not the bare wall.
+    - Input mesh: linearly interpolate depth of untouched holds (on_route False in
+      hold_contacts.csv); lift depth, mesh, and export under input/
+
+Stage 3: Reconstruction
+Depends on annotated holds, wall_mesh, hold catalog
+  - extract_scenegraph.py: (GPU batch job, after the catalog barrier)
+    - Query for touched holds, construct embedding for hold types (same construction as
+    the catalog), warm start intrinsics from prefit knn parameters; extrinsics start from
+    this hold's own frame in hold_frames.json.
+    - Fit with common/hold_fit.py, the same procedure the catalog uses:
+    differentiable SDF ray marching for depth and normals.
+    Supervision:
+    - Normal Map: bkg_normals.png (Marigold V2, from extract_hold_crops), and run linear interpolation on untouched holds
     - Depth Map: Run linear interpolation on untouched holds
-    
-    - Export optimized scenegraph to output/
+    - Export optimized scenegraph to output/ (per hold: cluster, program, frame,
+      extrinsics, intrinsics, score)
 
 Stage 4: Grounding
 Depends on input/output
   - post_processing.py
     - Fit floor plane of wall mesh.
-    - Normalize wall mesh, keyposes, and worldspace position of holds within same coordinate frame. 
+    - Normalize wall mesh, keyposes, and worldspace position of holds within same coordinate frame.
     Floor plane is up, and origin is centered within wall mesh bounding box and snapped to the ground.
-    - Scale scene to metric space according to known climber dimensions. 
+    - Scale scene to metric space according to known climber dimensions (climber.json).
 
 ----------------------
 - Modal/Prefect Orchestration
   - Suggestions for pending names?
-  - Suggestions for versioning? 
+  - Suggestions for versioning?
   - I do want the dashboard
-  - Want success flags/idempotency 
-  - Claude's batching API for agentic CPU jobs. 
-I am thinking of keeping a separate repo for these processing scripts. 
-I am wondering how I should version dataset alongside code. 
+  - Want success flags/idempotency
+  - Claude's batching API for agentic CPU jobs.
+I am thinking of keeping a separate repo for these processing scripts.
+I am wondering how I should version dataset alongside code.
 
-
+Decisions:
+- Running the pipeline: each flow run is one pass over the DAG, not a daemon. For each
+  step it computes every video's cache key, skips videos whose marker matches,
+  dispatches the rest, waits for them, and moves on. It ends when every step has run.
+  Each step is checked per video, independently; a mismatch at one step does not stop
+  checking at the others. To pick up new raw videos or code/config changes, run the
+  flow again (manually, or on a Prefect schedule).
+- Prefect flows only orchestrate; all compute runs on Modal. One lightweight Prefect
+  work pool serves every deployment. Each step is a Prefect task, so the dashboard shows
+  per-step progress, plus a per-step table (cached / ran / failed) as an artifact.
+- Modal jobs are deployed once (scripts/deploy_jobs.py). Flows call them by name
+  (common/modal_jobs.py), with app "boulderdreamer-{job}" and function "{job}".
+- Claude batching: every pending request for a step goes in one submission (chunked only
+  at the API's per-batch limits). Each batch_id is saved under _batches/ right after
+  submitting, so a rerun after a crash re-attaches to the in-flight batch instead of
+  paying twice. Batches whose items are all outdated are cancelled.
+- Success flags = cache keys (common/stages.py). Each step declares its code paths
+  (hashed by AST, so comments/formatting/docstrings don't invalidate), the config fields it
+  reads, its model-code pins, and its upstream steps. Its key hashes all of these together
+  with the upstream steps' keys, so keys chain: any change invalidates exactly that step
+  and everything downstream. Raw videos enter as S3 ETags; climber metadata as a hash
+  of only height_cm/ape_index_cm; the hold catalog enters scenegraph as its own key.
+  The orchestrator computes keys and skips matches. Modal jobs write their own marker
+  as their last step (a crashed orchestrator never loses finished work). Agent steps have
+  no job, so the orchestrator writes their markers.
+- Dataset versioning: processed/ stays the single working copy, overwritten in place.
+  A release (dataset_flow release="name") is one small file, manifests/{name}.json, with
+  one row per sample (video): its final post_processing key (covers the whole lineage)
+  plus the S3 VersionId of every input/ and output/ file. Enable S3 bucket versioning so
+  any release can be re-materialized after later runs overwrite processed/. Releases are
+  immutable. Code version is the git SHA recorded in each marker and manifest, so a
+  separate processing repo is fine.
+- Models: MoGe-3 (Ruicheng/moge-3-vitl), Marigold V2 normals (huawei-bayerlab/marigold-v2-0,
+  a LoRA on Qwen-Image-Edit-2509; ~17 GB VRAM at 1024^2), SAM2.1, GVHMR. Upstream code is
+  pinned by commit in common/pins.py; bumping a pin reruns only the dependent steps.

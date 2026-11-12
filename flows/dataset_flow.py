@@ -1,153 +1,83 @@
 """
-Dataset Flow — per-video processing pipeline for all filtered videos.
+Dataset Flow — stage-major processing of every filtered video.
 
-Stages:
-  1. Scene Perception: bkg plate, depth, poses
-  2. Hold Perception: hold descriptions (agent), hold crops (GPU)
-  3. Reconstruction: grounded poses, wall mesh, scenegraph
-  4. Grounding: post-processing (floor plane, metric normalization)
+  1. Scene perception     bkg_plate | depth                 (concurrent Modal maps)
+                          poses | hold_proposals            (poses need depth's K;
+                                                             proposals need the plate)
+  2. Hold perception      hold_descriptions                 (one Claude batch, all videos)
+                          hold_crops | hold_contacts | grounded_poses   (concurrent)
+                          wall_mesh                         (+ bare-wall depth, hold frames)
+  -- barrier --           hold catalog                      (reuse, or build/rebuild; fits
+                                                             with common/hold_fit.py)
+  3. Reconstruction       scenegraph                        (same hold_fit procedure,
+                                                             warm-started from the catalog)
+  4. Grounding            post_processing                   (Modal map)
+  (optional)              release manifest                  manifests/{release}.json
+
+Each stage runs only on videos whose upstream stages are current, and skips videos
+whose marker already matches the computed cache key.
 """
 
-from prefect import flow, task, get_run_logger
-from prefect.futures import wait
-import yaml
 import json
-import modal
 
-from common.idempotency import is_done, mark_done
-from common.s3 import get_client, download_bytes
+from prefect import flow, get_run_logger
 
-
-@task
-def load_config(config_path: str) -> dict:
-    with open(config_path) as f:
-        return yaml.safe_load(f)
+from common.s3 import download_bytes, get_client
+from flows.runtime import (
+    build_context, ensure_hold_catalog, load_config, publish_report, run_agent_stage,
+    run_modal_stage, write_climber_info, write_release,
+)
 
 
-@task
-def get_filtered_video_ids(config: dict) -> list[str]:
-    client = get_client(config["s3"]["region"])
-    bucket = config["s3"]["bucket"]
-    key = config["s3"]["prefixes"]["filtered_videos"] + "passing_video_ids.json"
-    return json.loads(download_bytes(client, bucket, key))
+def _concurrently(ctx, stages: list[str]):
+    futures = [run_modal_stage.submit(ctx, s) for s in stages]
+    for f in futures:
+        f.result()
 
-
-# ---------------------------------------------------------------------------
-# Stage 1: Scene Perception
-# ---------------------------------------------------------------------------
-
-@task
-def stage1_scene_perception(video_id: str, config: dict):
-    from jobs.extract_bkg_plate.job import app as bkg_app, extract_bkg_plate
-    from jobs.extract_depth.job import app as depth_app, extract_depth
-    from jobs.extract_poses.job import app as poses_app, extract_poses
-
-    client = get_client(config["s3"]["region"])
-    bucket = config["s3"]["bucket"]
-    prefix = config["s3"]["prefixes"]["processed"] + f"{video_id}/"
-
-    for name, app, fn in [
-        ("bkg_plate", bkg_app, extract_bkg_plate),
-        ("depth", depth_app, extract_depth),
-        ("poses", poses_app, extract_poses),
-    ]:
-        if is_done(client, bucket, prefix + name + "/"):
-            continue
-        fn.remote(video_id, config)
-        mark_done(client, bucket, prefix + name + "/")
-
-
-# ---------------------------------------------------------------------------
-# Stage 2: Hold Perception
-# ---------------------------------------------------------------------------
-
-@task
-def stage2_hold_perception(video_id: str, config: dict):
-    from agents.extract_hold_descriptions.agent import (
-        submit_hold_description_batch,
-        poll_hold_description_batch,
-    )
-    from jobs.extract_hold_crops.job import app, extract_hold_crops
-
-    client = get_client(config["s3"]["region"])
-    bucket = config["s3"]["bucket"]
-    prefix = config["s3"]["prefixes"]["processed"] + f"{video_id}/holds/"
-
-    if not is_done(client, bucket, prefix + "descriptions/"):
-        batch_id = submit_hold_description_batch(video_id, config)
-        poll_hold_description_batch(batch_id, config)
-        mark_done(client, bucket, prefix + "descriptions/")
-
-    if not is_done(client, bucket, prefix + "crops/"):
-        extract_hold_crops.remote(video_id, config)
-        mark_done(client, bucket, prefix + "crops/")
-
-
-# ---------------------------------------------------------------------------
-# Stage 3: Reconstruction
-# ---------------------------------------------------------------------------
-
-@task
-def stage3_reconstruction(video_id: str, config: dict):
-    from jobs.extract_grounded_poses.job import app as gp_app, extract_grounded_poses
-    from jobs.extract_wall_mesh.job import app as wm_app, extract_wall_mesh
-    from jobs.extract_scenegraph.job import app as sg_app, extract_scenegraph
-
-    client = get_client(config["s3"]["region"])
-    bucket = config["s3"]["bucket"]
-    prefix = config["s3"]["prefixes"]["processed"] + f"{video_id}/"
-
-    for name, fn in [
-        ("output/grounded_poses", extract_grounded_poses),
-        ("input/wall_mesh", extract_wall_mesh),
-        ("output/scenegraph", extract_scenegraph),
-    ]:
-        if is_done(client, bucket, prefix + name + "/"):
-            continue
-        fn.remote(video_id, config)
-        mark_done(client, bucket, prefix + name + "/")
-
-
-# ---------------------------------------------------------------------------
-# Stage 4: Grounding
-# ---------------------------------------------------------------------------
-
-@task
-def stage4_grounding(video_id: str, config: dict):
-    from jobs.post_processing.job import app, post_processing
-
-    client = get_client(config["s3"]["region"])
-    bucket = config["s3"]["bucket"]
-    prefix = config["s3"]["prefixes"]["processed"] + f"{video_id}/grounded/"
-
-    if is_done(client, bucket, prefix):
-        return
-    post_processing.remote(video_id, config)
-    mark_done(client, bucket, prefix)
-
-
-# ---------------------------------------------------------------------------
-# Top-level flow
-# ---------------------------------------------------------------------------
 
 @flow(name="produce-dataset", log_prints=True)
-def dataset_flow(config_path: str = "configs/pipeline.yaml"):
+def dataset_flow(
+    config_path: str = "configs/pipeline.yaml",
+    video_ids: list[str] | None = None,
+    rebuild_catalog: bool = False,
+    release: str | None = None,
+):
+    """
+    video_ids:        subset to process (default: filtered_videos/passing_video_ids.json)
+    rebuild_catalog:  rebuild the global hold catalog from all current videos before
+                      reconstruction (invalidates every scenegraph downstream)
+    release:          if set, write an immutable manifests/{release}.json at the end
+    """
     logger = get_run_logger()
     config = load_config(config_path)
-    video_ids = get_filtered_video_ids(config)
-    logger.info(f"Processing {len(video_ids)} videos.")
+    if video_ids is None:
+        key = config["s3"]["prefixes"]["filtered_videos"] + "passing_video_ids.json"
+        video_ids = json.loads(download_bytes(get_client(config["s3"]["region"]),
+                                              config["s3"]["bucket"], key))
+    ctx = build_context(config, video_ids)
+    logger.info(f"Processing {len(ctx.video_ids)} videos (git {ctx.git_sha}).")
 
-    for video_id in video_ids:
-        logger.info(f"[{video_id}] Stage 1: Scene Perception")
-        stage1_scene_perception(video_id, config)
+    # Stage 1: Scene Perception (+ hold proposals, which only need the clean plate)
+    _concurrently(ctx, ["extract_bkg_plate", "extract_depth"])
+    _concurrently(ctx, ["extract_poses", "extract_hold_proposals"])
 
-        logger.info(f"[{video_id}] Stage 2: Hold Perception")
-        stage2_hold_perception(video_id, config)
+    # Stage 2: Hold Perception
+    run_agent_stage(ctx, "extract_hold_descriptions")
+    _concurrently(ctx, ["extract_hold_crops", "extract_hold_contacts", "extract_grounded_poses"])
+    run_modal_stage(ctx, "extract_wall_mesh")
 
-        logger.info(f"[{video_id}] Stage 3: Reconstruction")
-        stage3_reconstruction(video_id, config)
+    # Barrier: global hold catalog (fit on the same hold frames the scenegraph uses)
+    ensure_hold_catalog(ctx, rebuild=rebuild_catalog)
 
-        logger.info(f"[{video_id}] Stage 4: Grounding")
-        stage4_grounding(video_id, config)
+    # Stage 3: Reconstruction
+    run_modal_stage(ctx, "extract_scenegraph")
 
-    logger.info("Dataset production complete.")
+    # Stage 4: Grounding
+    run_modal_stage(ctx, "post_processing", before_dispatch=write_climber_info)
+
+    publish_report(ctx, "dataset-stages")
+    done = len(ctx.ok["post_processing"])
+    logger.info(f"Dataset production complete: {done}/{len(ctx.video_ids)} videos current.")
+
+    if release:
+        write_release(ctx, release)

@@ -1,18 +1,18 @@
 """
-extract_hold_crops logic — per-video version.
-Mirrors catalog version but reads from processed/{video_id}/ paths.
+extract_hold_crops logic — Marigold V2 normals + per-hold crops for every labeled hold.
+Feeds both the per-video reconstruction and the global hold catalog.
 
 Steps:
-1. Download bkg_rgb.png from processed/{video_id}/
-2. Load holds/hold_descriptions.csv
-3. Run Marigold V2 on bkg_rgb.png -> normal map
-4. For each hold bbox:
-   a. Crop RGB, Normal
-   b. Run SAM2 with bbox prompt -> segmentation mask
-   c. Upload to processed/{video_id}/holds/hold_crops/{rgb,normal,segmentation}/
+1. Download bkg_rgb.png, holds/proposals/masks.npz, holds/hold_descriptions.csv
+2. Run Marigold V2 (normals checkpoint, models.marigold_v2.resolution) on bkg_rgb.png ->
+   camera-space normal map; upload processed/{video_id}/bkg_normals.png (reused by
+   extract_scenegraph as normal supervision, so the 20B model runs once per video)
+3. For each hold: mask = union of its mark_ids' proposal masks (SAM2 already ran in
+   extract_hold_proposals, so no prompting here); crop RGB, normal and mask at its bbox
+4. Upload to processed/{video_id}/holds/hold_crops/{rgb,normal,segmentation}/{hold_id}.png
 """
 
 
 def run(video_id: str, config: dict):
-    # TODO: implement — mirrors extract_hold_crops_catalog with different S3 paths
+    # TODO: implement
     raise NotImplementedError

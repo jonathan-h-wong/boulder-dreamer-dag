@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "boulderdreamer-dag"
@@ -10,9 +10,9 @@ requires-python = ">=3.11"
 dependencies = [
     # Orchestration
     "prefect>=3.0",
-    "modal>=0.73",
+    "modal>=1.0",
     # Claude Batch API
-    "anthropic>=0.30",
+    "anthropic>=0.40",
     # Data / compute
     "numpy",
     "opencv-python-headless",
@@ -21,6 +21,7 @@ dependencies = [
     "scikit-learn",
     "hdbscan",
     "pydantic>=2.0",
+    "pyyaml",
     # Storage
     "boto3",
     "s3fs",
@@ -33,7 +34,11 @@ dev = [
     "pytest",
     "ruff",
     "mypy",
+    "moto[s3]",   # tests/test_orchestration.py mocks S3
 ]
+
+[tool.setuptools.packages.find]
+include = ["agents*", "common*", "flows*", "jobs*"]
 
 [tool.ruff]
 line-length = 100

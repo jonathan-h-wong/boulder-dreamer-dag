@@ -10,6 +10,8 @@ pull:
       repository: "{{ prefect.variables.git_repo }}"
       branch: main
 
+# Flows only orchestrate (S3 reads, Modal dispatch, Claude batch polling) — all compute
+# runs on Modal — so a single lightweight process pool serves every deployment.
 deployments:
 
   - name: filter-videos
@@ -18,20 +20,22 @@ deployments:
     parameters:
       config_path: configs/pipeline.yaml
     work_pool:
-      name: modal-cpu-pool
+      name: boulderdreamer-orchestrator
 
   - name: curate-hold-catalog
     version: "{{ prefect.variables.pipeline_version }}"
     entrypoint: flows/hold_catalog_flow.py:hold_catalog_flow
     parameters:
       config_path: configs/pipeline.yaml
+      rebuild: true
     work_pool:
-      name: modal-gpu-pool
+      name: boulderdreamer-orchestrator
 
   - name: produce-dataset
     version: "{{ prefect.variables.pipeline_version }}"
     entrypoint: flows/dataset_flow.py:dataset_flow
     parameters:
       config_path: configs/pipeline.yaml
+      rebuild_catalog: false
     work_pool:
-      name: modal-gpu-pool
+      name: boulderdreamer-orchestrator

@@ -1,36 +1,27 @@
 """
-Prompts for the video filter agent.
+Prompts for the video filter agent. The response format is enforced separately by the
+FilterJudgment JSON schema (structured outputs); the prompt only defines the criteria.
 """
 
-SYSTEM_PROMPT = """You are a computer vision analyst reviewing climbing gym footage.
-Your job is to evaluate short video clips and determine whether each clip is suitable
-for downstream 3D reconstruction and motion analysis. Be concise and return structured JSON."""
+SYSTEM_PROMPT = """You review short climbing-gym videos to decide whether each is usable for
+3D reconstruction of a single climber on a single wall. You see a handful of frames sampled
+evenly across the whole video, in order. Judge each criterion independently, and answer in
+the required structured format."""
 
 
-def build_filter_prompt(video_id: str, frame_b64s: list[str]) -> str:
-    """
-    video_id: identifier string
-    frame_b64s: list of base64-encoded JPEG frames (downsampled from video)
-    Returns a user message string.
-    """
-    return f"""Evaluate the following sampled frames from video '{video_id}' for these criteria:
+def build_filter_prompt(video_id: str, n_frames: int) -> str:
+    return f"""The {n_frames} images are frames sampled evenly across video '{video_id}', in order.
 
-1. too_many_climbers: Are there 2 or more climbers visible simultaneously at any point?
-2. camera_blur: Is the camera significantly blurry or out of focus?
-3. moving_camera: Is the camera panning, tilting, or otherwise moving? (not a static mount)
-4. no_floor_plane: Is the gym floor NOT visible in any frame?
-5. missing_climber_metadata: (Do not evaluate — set to false, handled externally)
+Mark a criterion true only if the frames show it clearly:
+- too_many_climbers: two or more people are on the wall or climbing at the same time in any
+  frame. Downstream pose extraction assumes exactly one climber. Spectators or belayers
+  standing on the floor do not count.
+- camera_blur: frames are significantly blurry or out of focus, enough to hide hold edges.
+  Motion blur on the climber alone does not count.
+- moving_camera: the camera pans, tilts, zooms, or is handheld. Compare the wall and floor
+  across frames; the background plate is recovered by median filtering, which needs a static
+  camera.
+- no_floor_plane: the gym floor or mat is not visible in any frame. The floor sets the
+  gravity-aligned world frame.
 
-Return a JSON object with this exact schema:
-{{
-  "video_id": "{video_id}",
-  "passed": <bool>,
-  "too_many_climbers": <bool>,
-  "camera_blur": <bool>,
-  "moving_camera": <bool>,
-  "no_floor_plane": <bool>,
-  "missing_climber_metadata": false,
-  "notes": "<optional short explanation>"
-}}
-
-A video passes only if ALL criteria are false."""
+In notes, give one short sentence naming what failed, or leave it empty if nothing did."""

@@ -1,90 +1,110 @@
 """
-Hold description extraction agent — per-video version.
-Runs on clean plate + pose overlay, produces holds/hold_descriptions.csv per video.
+Hold description agent (set-of-marks) — one Claude batch request per video, dispatched
+together by agents.base.run_batch_stage. Its output also feeds the global hold catalog.
+
+Input (from extract_hold_proposals):
+  processed/{video_id}/bkg_rgb.png
+  processed/{video_id}/holds/proposals/marks.json
+      {"image_size": [w, h], "marks": {"<mark_id>": {"bbox": [x0, y0, x1, y1], "area": int,
+                                                     "centroid": [x, y]}}}
+  processed/{video_id}/holds/proposals/tiles/*.png   (numbered overlay tiles)
+Output:
+  processed/{video_id}/holds/hold_labels.json        validated HoldLabelResponse (raw judgment)
+  processed/{video_id}/holds/hold_descriptions.csv   HoldRecord rows; hold_id and bbox are
+                                                     computed here from the marks, on_route /
+                                                     mounted_on stay empty (extract_hold_contacts
+                                                     writes those to hold_contacts.csv)
 """
 
-import json
+import base64
 import csv
 import io
+import json
 
-from agents.base import get_client, poll_batch
+from agents.base import output_config, parse_structured
 from agents.extract_hold_descriptions.prompts import SYSTEM_PROMPT, build_hold_description_prompt
-from common.schemas import HoldDescriptionWithRoute
-from common.s3 import get_client as get_s3_client
+from common.s3 import download_bytes, get_client, list_keys
+from common.schemas import HoldLabelResponse, HoldRecord
 
 
-def _get_video_bkg_b64(video_id: str, config: dict) -> str:
-    """Download per-video bkg plate and return as base64 JPEG."""
-    # TODO: implement
-    raise NotImplementedError
+def _holds_prefix(video_id: str, config: dict) -> str:
+    return f"{config['s3']['prefixes']['processed']}{video_id}/holds/"
 
 
-def _get_pose_overlay_b64(video_id: str, config: dict) -> str | None:
-    """Download pose overlay image (bkg plate + keypose visualization) if available."""
-    # TODO: implement
-    return None
+def _load_marks(video_id: str, config: dict) -> dict[int, dict]:
+    s3 = get_client(config["s3"]["region"])
+    raw = download_bytes(s3, config["s3"]["bucket"], _holds_prefix(video_id, config) + "proposals/marks.json")
+    return {int(k): v for k, v in json.loads(raw)["marks"].items()}
 
 
-def submit_hold_description_batch(video_id: str, config: dict) -> str:
-    """Submit a Claude batch request for a single video's hold detection."""
-    client = get_client()
-    image_b64 = _get_video_bkg_b64(video_id, config)
-    pose_b64 = _get_pose_overlay_b64(video_id, config)
-
-    content = [
-        {"type": "text", "text": build_hold_description_prompt(video_id)},
-        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64}},
-    ]
-    if pose_b64:
-        content.append({"type": "text", "text": "Pose overlay:"})
-        content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": pose_b64}})
-
-    import anthropic
-    requests = [
-        anthropic.types.message_create_params.MessageCreateParamsNonStreaming(
-            custom_id=video_id,
-            params={
-                "model": config["agents"]["model"],
-                "max_tokens": config["agents"]["max_tokens"],
-                "system": SYSTEM_PROMPT,
-                "messages": [{"role": "user", "content": content}],
-            },
-        )
-    ]
-
-    batch = client.messages.batches.create(requests=requests)
-    return batch.id
+def _image_block(data: bytes, media_type: str = "image/png") -> dict:
+    return {"type": "image", "source": {"type": "base64", "media_type": media_type,
+                                        "data": base64.b64encode(data).decode()}}
 
 
-def poll_hold_description_batch(batch_id: str, config: dict):
-    """Poll until complete, validate schema, write hold_descriptions.csv to S3."""
-    client = get_client()
-    s3 = get_s3_client(config["s3"]["region"])
+def build_params(video_id: str, config: dict) -> dict:
+    s3 = get_client(config["s3"]["region"])
     bucket = config["s3"]["bucket"]
+    marks = _load_marks(video_id, config)
+    tile_keys = sorted(k for k in list_keys(s3, bucket, _holds_prefix(video_id, config) + "proposals/tiles/")
+                       if k.endswith(".png"))
+    if not tile_keys:
+        raise FileNotFoundError(f"no overlay tiles for {video_id}")
+    plate = download_bytes(s3, bucket, f"{config['s3']['prefixes']['processed']}{video_id}/bkg_rgb.png")
 
-    raw_results = poll_batch(client, batch_id)
+    content = [_image_block(plate)]
+    content += [_image_block(download_bytes(s3, bucket, k)) for k in tile_keys]
+    content.append({"type": "text",
+                    "text": build_hold_description_prompt(video_id, len(marks), len(tile_keys))})
+    return {
+        "model": config["agents"]["model"],
+        "max_tokens": config["agents"]["max_tokens"],
+        "system": SYSTEM_PROMPT,
+        "messages": [{"role": "user", "content": content}],
+        "output_config": output_config(HoldLabelResponse, config["agents"].get("effort")),
+    }
 
-    for result in raw_results:
-        video_id = result.custom_id
-        if result.result.type != "succeeded":
-            print(f"Batch result failed for {video_id}")
-            continue
 
-        text = result.result.message.content[0].text
-        data = json.loads(text)
-        holds = [HoldDescriptionWithRoute(**h).model_dump() for h in data.get("holds", [])]
+def _union_bbox(boxes: list[list[int]]) -> list[int]:
+    return [min(b[0] for b in boxes), min(b[1] for b in boxes),
+            max(b[2] for b in boxes), max(b[3] for b in boxes)]
 
-        buf = io.StringIO()
-        if holds:
-            writer = csv.DictWriter(buf, fieldnames=holds[0].keys())
-            writer.writeheader()
-            writer.writerows(holds)
 
-        prefix = config["s3"]["prefixes"]["processed"]
-        s3.put_object(
-            Bucket=bucket,
-            Key=f"{prefix}{video_id}/holds/hold_descriptions.csv",
-            Body=buf.getvalue().encode(),
-            ContentType="text/csv",
+def build_records(labels: HoldLabelResponse, marks: dict[int, dict]) -> list[HoldRecord]:
+    """Assign stable hold_ids (ordered by smallest mark id) and bboxes from the marks."""
+    labels.check_coverage(set(marks))
+    ordered = sorted(labels.holds, key=lambda h: min(h.mark_ids))
+    return [
+        HoldRecord(
+            hold_id=f"h{i:03d}",
+            mark_ids=sorted(h.mark_ids),
+            bbox=_union_bbox([marks[m]["bbox"] for m in h.mark_ids]),
+            **h.model_dump(exclude={"mark_ids"}),
         )
-        print(f"[{video_id}] Wrote {len(holds)} hold descriptions.")
+        for i, h in enumerate(ordered)
+    ]
+
+
+def records_to_csv(records: list[HoldRecord]) -> str:
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=list(HoldRecord.model_fields))
+    writer.writeheader()
+    for r in records:
+        row = r.model_dump(mode="json")
+        row["mark_ids"] = json.dumps(row["mark_ids"])
+        row["bbox"] = json.dumps(row["bbox"])
+        writer.writerow(row)
+    return buf.getvalue()
+
+
+def handle_result(video_id: str, message, config: dict) -> None:
+    labels = parse_structured(message, HoldLabelResponse)
+    records = build_records(labels, _load_marks(video_id, config))
+
+    s3 = get_client(config["s3"]["region"])
+    bucket, prefix = config["s3"]["bucket"], _holds_prefix(video_id, config)
+    s3.put_object(Bucket=bucket, Key=prefix + "hold_labels.json",
+                  Body=labels.model_dump_json(indent=2).encode(), ContentType="application/json")
+    s3.put_object(Bucket=bucket, Key=prefix + "hold_descriptions.csv",
+                  Body=records_to_csv(records).encode(), ContentType="text/csv")
+    print(f"[{video_id}] {len(records)} holds, {len(labels.non_hold_marks)} non-hold marks")

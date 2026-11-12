@@ -1,22 +1,23 @@
 """
-extract_scenegraph logic — constructs the optimized scenegraph for a video.
+extract_scenegraph logic — fits this video's on-route holds with the same procedure as
+the catalog (common/hold_fit.py), so parameters are directly comparable.
 
 Steps:
-1. Load hold_descriptions.csv, hold_crops, bkg_rgb.png, bkg_depth.png from S3
-2. Load embeddings.npy + knn_labels from hold_catalog
+1. Load hold_descriptions.csv + hold_contacts.csv (on_route, mounted_on), hold_crops,
+   hold_frames.json, bkg_depth.png, bkg_normals.png, intrinsics.json from S3
+2. Load embeddings.npy + knn_labels.parquet + parametric_holds.py from hold_catalog/
 3. For each on-route hold:
-   a. Query KNN catalog embedding -> nearest cluster + warm-start parametric params
-   b. Initialize parametric hold on 2D bbox + lifted 3D depth from bkg_depth
-   c. Run differentiable SDF ray marching for depth and normals
-   d. Supervision:
-      - Normal: Marigold V2 on-the-fly normal map (untouched holds linearly interpolated)
-      - Depth: untouched hold depth linear interpolation
-   e. Optimize hold intrinsic parameters
-4. Run gaussian splatting on hold segmentation masks + bkg plate (no color)
-5. Export scenegraph.json to processed/{video_id}/output/scenegraph.json
+   a. Same embedding construction as the catalog -> kNN -> cluster + program;
+      intrinsics init = distance-weighted mean of the neighbors' fitted intrinsics
+   b. Extrinsics init from this video's own hold frame (never from neighbors):
+      theta multi-start by symmetry, tilt 0, offset 0
+   c. hold_fit.fit_hold: differentiable SDF ray marching, supervised by the hold mask,
+      bkg_normals.png and bkg_depth inside the mask
+4. Export scenegraph.json (per hold: hold_id, cluster, program, frame, extrinsics,
+   intrinsics, score) to processed/{video_id}/output/scenegraph.json
 """
 
 
 def run(video_id: str, config: dict):
-    # TODO: implement differentiable SDF optimization + gsplat
+    # TODO: implement (fitting lives in common/hold_fit.py)
     raise NotImplementedError

@@ -1,17 +1,23 @@
-"""extract_hold_crops — GPU Modal job (Marigold V2 + SAM2, per-video version)."""
+"""extract_hold_crops — GPU Modal job (Marigold V2 normals + per-hold crops)."""
 
 import modal
-from common.modal_images import gpu_sam2_marigold
 
-app = modal.App("boulderdreamer-extract-hold-crops")
+from common.modal_images import gpu_marigold, WEIGHTS_MOUNT, weights_volume
+from common.modal_jobs import app_name
+
+app = modal.App(app_name("extract_hold_crops"))
 
 
 @app.function(
-    image=gpu_sam2_marigold,
+    image=gpu_marigold,
     secrets=[modal.Secret.from_name("boulderdreamer-secrets")],
-    gpu="A10G",
+    volumes={WEIGHTS_MOUNT: weights_volume},
+    gpu="A10G",  # 24 GB covers Marigold V2 at 1024^2; use "L40S" for 2048^2
     timeout=1800,
 )
-def extract_hold_crops(video_id: str, config: dict):
+def extract_hold_crops(video_id: str, marker: dict, config: dict):
+    from common.idempotency import write_marker
     from jobs.extract_hold_crops.logic import run
+
     run(video_id, config)
+    write_marker(marker)  # last step: only reached if outputs were fully written
