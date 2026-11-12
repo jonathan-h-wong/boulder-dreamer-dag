@@ -1,0 +1,8 @@
+torch
+gsplat
+trimesh
+open3d
+diffusers>=0.27
+transformers>=4.40
+numpy
+boto3

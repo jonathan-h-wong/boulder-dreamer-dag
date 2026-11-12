@@ -1,0 +1,5 @@
+numpy
+scipy
+smplx
+trimesh
+boto3

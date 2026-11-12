@@ -1,0 +1,37 @@
+# prefect.yaml — deployment definitions for all BoulderDreamer flows
+name: boulderdreamer-dag
+prefect-version: "3.0"
+
+build: null
+push: null
+
+pull:
+  - prefect.deployments.steps.git_clone:
+      repository: "{{ prefect.variables.git_repo }}"
+      branch: main
+
+deployments:
+
+  - name: filter-videos
+    version: "{{ prefect.variables.pipeline_version }}"
+    entrypoint: flows/filter_flow.py:filter_flow
+    parameters:
+      config_path: configs/pipeline.yaml
+    work_pool:
+      name: modal-cpu-pool
+
+  - name: curate-hold-catalog
+    version: "{{ prefect.variables.pipeline_version }}"
+    entrypoint: flows/hold_catalog_flow.py:hold_catalog_flow
+    parameters:
+      config_path: configs/pipeline.yaml
+    work_pool:
+      name: modal-gpu-pool
+
+  - name: produce-dataset
+    version: "{{ prefect.variables.pipeline_version }}"
+    entrypoint: flows/dataset_flow.py:dataset_flow
+    parameters:
+      config_path: configs/pipeline.yaml
+    work_pool:
+      name: modal-gpu-pool

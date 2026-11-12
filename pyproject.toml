@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "boulderdreamer-dag"
+version = "0.1.0"
+description = "BoulderDreamer processing pipeline: video filtering, hold cataloging, and dataset production."
+requires-python = ">=3.11"
+dependencies = [
+    # Orchestration
+    "prefect>=3.0",
+    "modal>=0.73",
+    # Claude Batch API
+    "anthropic>=0.30",
+    # Data / compute
+    "numpy",
+    "opencv-python-headless",
+    "Pillow",
+    "scipy",
+    "scikit-learn",
+    "hdbscan",
+    "pydantic>=2.0",
+    # Storage
+    "boto3",
+    "s3fs",
+    # DVC
+    "dvc[s3]",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff",
+    "mypy",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]

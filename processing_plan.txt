@@ -1,0 +1,172 @@
+Directories/Scripts, based on steps: 
+
+1) Video Filtering 
+filtered videos/
+
+- filter_video.py (agentic CPU batch job)
+  - Too many climbers: Downstream video analysis assumes human extraction of a single human. 
+  Inspect downsampled video to check for multiple humans throughout duration of video.
+  - Camera Blur: Camera blur introduces noise into downstream depth models and shape analysis.
+  Discard videos in which camera is too blurry/goes out of focus.
+  - Moving Camera: Downstream analysis assumes a static camera to retrieve background plate via median filtering. 
+  Discard videos with a moving camera. 
+  - Contains floor plane: Floor plane is necessary to establish a gravity-aligned world frame. 
+  Discard videos that do not contain the floor. 
+  - Climber height metadata: 
+  Discard videos that do not have climber metadata, as this is necessary for metric scaling. 
+
+
+2) Curate Hold Catalog-- route agnostic, global catalog.
+Hold data persists after cataloging in the case of re-embedding.
+hold_catalog/
+  |-- holds/
+    |-- hold_descriptions.csv
+    |-- hold_crops/{rgb, normal, segmentation}
+
+  |-- parametric_holds.py
+  |-- embeddings.npy
+  |-- knn_labels json/parquet
+
+In place downsampling + median filtering. Downsampling rate can be quite aggressive:
+Stage 1: Extract Hold Descriptions
+- extract_hold_descriptions.py (CPU agent job, writes crop boundaries)
+  Agent prompt: 
+  'Identify all the climbing holds and volumes in the following image. 
+   Focus on the holds and volumes on closest wall the camera is focusing on. Ignore contents on further walls.
+   Be comprehensive. Detect small footholds, and volumes being occluded by mounted holds. 
+   For each hold or volume, export crop coordinates and schema fields' 
+
+Stage 2: Extract Hold Crops
+- extract_hold_crops.py (GPU batch job)
+  Runs Marigold V2 and SAM2 and extracts {rgb, normal, segmentation} image crops. 
+
+Stage 3: Curate Hold Catalog
+- curate_hold_catalog.py (single CPU agent run)
+  Runs embedding construction, clustering, authors differentiable parametric holds/volumes, 
+  and produces output embedding matrix and knn labels. 
+  
+Schema for extract_hold_descriptions:
+Field	        Values
+hold_type	    jug, crimp_edge, rail, sloper, pinch, pocket, horn_knob, foot_chip, volume_pyramid, volume_dome, volume_other, macro_slab, wedge_chip, flake, other
+outline	        round, oval, elongated, rectangular, triangular, irregular, crescent
+profile	        convex_dome, flat_top, dished, hollowed, ridge, faceted, mixed
+lip	            none, rounded, sharp, incut
+opening	        none, single_finger, two_finger, three_finger, hand_scoop, slot
+symmetry	    bilateral, radial, none
+relative_size	tiny, small, medium, large, volume
+depth_class	    shallow, medium, deep, very_deep
+free description, limited to two sentences. 
+
+Embedding construction: 
+Concatenated/Combined in intelligent way: 
+- One hot encoded fields
+- free description encoded with text transformer 
+- Normal histogram rather than DINO encoding, which I sense is out of distribution here.
+
+Clustering/Export for Querying: 
+- HDBSCAN on PCA of fused vector, which discovers number of clusters. 
+For each cluster, sample max of 50 farthest-point samples and feed {RGB, Normal} crops + schema descriptions
+into Claude for procedural program generation. Optimized fit of extrinsic wall tilt 
+and intrinsic shape parameters should be greater than 80%. Loss is some combination of segmentation IoU and normal alignment.
+With procedural program settled, fit all remaining holds, exporting only the intrinsic parameters. 
+
+After this, will have: 
+- Matrix of embedding vectors
+- Corresponding table of class category + associated fit parameters
+A downstream query uses the same embedding construction to fetch the corresponding cluster
+based on weighted distances to nearest neighbors, and warmstarts fit parameters from these neighbors.
+- parametric_holds.py
+
+
+3) Produce dataset-- no need to keep intermediate maps around on S3. 
+processed/
+  |-- {video_id}
+    |-- bkg_rbg.png  (or some other img format)
+    |-- bkg_depth.png  (or some other img format)
+    |-- depth_samples/
+      |-- imgs/
+      |-- intrinsics/
+    |-- poses.npy
+
+    |-- holds/
+      |-- hold_descriptions.csv
+      |-- hold_crops/{rgb, normal, segmentation}
+
+    |-- input/
+      |-- wall_mesh.glb (or some other 3D format)
+    |-- output/
+      |-- scenegraph.json (custom json format)
+      |-- poses.npy
+
+
+Batch script, each worker writes keyframes to processed/:
+Stage 1: Scene Perception
+All steps here take a downsampling rate.
+  - extract_bkg_plate.py: (Batch CPU job)
+    - Median filter over specified downsampled rate.
+  - extract_depth.py: (Batch GPU job)
+    - MoGe-2 depth model. Outputs depth and intrinsic. Run on specified downsampled rate.
+    - Resolve bkg depth: Median on depth maps for base depth.
+  - extract_poses.py: (Batch GPU job) 
+    - GVHMR model. Run on full video sequence, and subsample output to specified downsampling rate.
+
+Stage 2: Hold Perception
+Depends on clean plate, poses.
+Mirrors 'extract hold description, extract hold crops' in hold cataloguing. 
+  Stage 1: 
+  - extract_hold_descriptions.py: (Agentic CPU batch job)
+    Agent prompt: 
+    'Identify all the climbing holds and volumes in the following image. 
+    Focus on the holds and volumes on closest wall the camera is focusing on. Ignore contents on further walls.
+    Be comprehensive. Detect small footholds, and volumes being occluded by mounted holds. 
+    For each hold or volume, export crop coordinates, schema fields, 
+    and also a boolean value the describes whether a hold or volume is on-route, ie.
+    touched by a climber's hands or feet. If a climber touches a hold mounted onto a volume, 
+    the volume is considered to be on-route.' 
+    Pass in the clean plate + poses. 
+
+  Stage 2: 
+  - extract_hold_crops.py: (GPU batch job)
+    - Run Marigold V2 and SAM2 and extract {rgb, normal, segmentation} image crops. 
+
+Stage 3: Reconstruction
+Depends on annotated holds 
+  - extract_grounded_poses.py: (CPU batch job)
+    - Perform best fit of human across all depth maps to synchronize independent NN outputs.
+    Use extracted pose + intrinsics to rasterize human segmentation mask to apply on depth map. CPU rasterization. 
+    - Export under output/
+
+  - extract_wall_mesh.py: (CPU batch job)
+    - Linearly interpolate depth of untouched holds
+    - Lift depth, mesh, and export under input/
+    
+  - extract_scenegraph.py: (GPU batch job) 
+    - Query for touched holds, construct embedding for hold types, 
+    warm start differentiable parametric hold on prefit knn parameters + lifted 3D depth. 
+    
+    Use differentiable SDF ray marching for depth and normals.
+    Supervision: 
+    - Normal Map: Run MarigoldV2 for on-the-fly clean plate normal map, and run linear interpolation on untouched holds
+    - Depth Map: Run linear interpolation on untouched holds
+    
+    - Export optimized scenegraph to output/
+
+Stage 4: Grounding
+Depends on input/output
+  - post_processing.py
+    - Fit floor plane of wall mesh.
+    - Normalize wall mesh, keyposes, and worldspace position of holds within same coordinate frame. 
+    Floor plane is up, and origin is centered within wall mesh bounding box and snapped to the ground.
+    - Scale scene to metric space according to known climber dimensions. 
+
+----------------------
+- Modal/Prefect Orchestration
+  - Suggestions for pending names?
+  - Suggestions for versioning? 
+  - I do want the dashboard
+  - Want success flags/idempotency 
+  - Claude's batching API for agentic CPU jobs. 
+I am thinking of keeping a separate repo for these processing scripts. 
+I am wondering how I should version dataset alongside code. 
+
+

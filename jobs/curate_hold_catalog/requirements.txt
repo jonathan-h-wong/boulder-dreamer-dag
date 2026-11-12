@@ -1,0 +1,6 @@
+scikit-learn
+hdbscan
+numpy
+boto3
+anthropic>=0.30
+sentence-transformers

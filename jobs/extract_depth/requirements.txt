@@ -1,0 +1,5 @@
+torch
+moge
+numpy
+opencv-python-headless
+boto3

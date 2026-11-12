@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+venv/
+env/
+
+# Secrets
+configs/.secrets.yaml
+*.secrets.yaml
+.env
+
+# Data / model outputs (keep on S3/DVC, not git)
+filtered_videos/
+hold_catalog/
+processed/
+*.npy
+*.glb
+*.png
+*.jpg
+*.jpeg
+*.mp4
+*.mov
+
+# DVC
+/tmp
+.dvc/cache
+.dvc/tmp
+
+# Modal
+.modal/
+
+# Prefect
+.prefect/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

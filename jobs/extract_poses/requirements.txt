@@ -1,0 +1,6 @@
+torch
+gvhmr
+smplx
+numpy
+opencv-python-headless
+boto3

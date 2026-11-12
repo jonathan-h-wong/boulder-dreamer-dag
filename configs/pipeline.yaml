@@ -1,0 +1,38 @@
+pipeline:
+  version: "0.1.0"
+
+s3:
+  bucket: "boulderdreamer-data"
+  region: "us-east-1"
+  prefixes:
+    filtered_videos: "filtered_videos/"
+    hold_catalog: "hold_catalog/"
+    processed: "processed/"
+
+downsampling:
+  # Aggressive downsampling for background plate and hold detection
+  hold_catalog_rate: 10          # every Nth frame for catalog bkg extraction
+  bkg_plate_rate: 10             # every Nth frame for per-video bkg plate
+  depth_rate: 5                  # every Nth frame for depth sampling
+  keypose_rate: 1                # full sequence (GVHMR runs on all frames)
+
+models:
+  moge2:
+    checkpoint: "moge-v2-vitl"   # TODO: update with exact HF path
+  gvhmr:
+    checkpoint: "gvhmr-base"     # TODO: update with exact path
+  sam2:
+    checkpoint: "sam2_hiera_large.pt"
+  marigold_v2:
+    checkpoint: "prs-eth/marigold-v1-0"  # TODO: update to v2 release
+
+hold_catalog:
+  max_farthest_point_samples: 50
+  hdbscan_min_cluster_size: 5
+  pca_components: 64
+  parametric_fit_min_iou: 0.80
+
+agents:
+  model: "claude-opus-4-5"
+  max_tokens: 4096
+  batch_max_concurrent: 50       # Claude batch API concurrency
