@@ -57,11 +57,11 @@ def build_params(video_id: str, config: dict) -> dict:
     content.append({"type": "text",
                     "text": build_hold_description_prompt(video_id, len(marks), len(tile_keys))})
     return {
-        "model": config["agents"]["model"],
-        "max_tokens": config["agents"]["max_tokens"],
+        "model": config["agents"]["extract_hold_descriptions"]["model"],
+        "max_tokens": config["agents"]["extract_hold_descriptions"]["max_tokens"],
         "system": SYSTEM_PROMPT,
         "messages": [{"role": "user", "content": content}],
-        "output_config": output_config(HoldLabelResponse, config["agents"].get("effort")),
+        "output_config": output_config(HoldLabelResponse, config["agents"]["extract_hold_descriptions"].get("effort")),
     }
 
 

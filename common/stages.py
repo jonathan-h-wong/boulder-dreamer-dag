@@ -55,14 +55,12 @@ def _video(name, runner, root="processed", **kw) -> Stage:
     return Stage(name=name, runner=runner, scope="video", root=root, code=code, **kw)
 
 
-_AGENT_CFG = ("agents.model", "agents.max_tokens")
-
 STAGES: dict[str, Stage] = {s.name: s for s in [
     # --- filter flow -----------------------------------------------------------
     _video("extract_filter_frames", "modal", root="filtered_videos",
            deps=("raw_video",), config_keys=("filter.n_frames",)),
     _video("filter_video", "agent", root="filtered_videos",
-           deps=("extract_filter_frames",), config_keys=(*_AGENT_CFG, "agents.effort")),
+           deps=("extract_filter_frames",), config_keys=("agents.filter_video",)),
 
     # --- dataset flow: scene perception ------------------------------------------
     _video("extract_bkg_plate", "modal",
@@ -80,7 +78,7 @@ STAGES: dict[str, Stage] = {s.name: s for s in [
            config_keys=("hold_proposals", "models.sam2"), pins=("SAM2_REF",)),
     _video("extract_hold_descriptions", "agent",
            deps=("extract_bkg_plate", "extract_hold_proposals"),
-           config_keys=(*_AGENT_CFG, "agents.effort")),
+           config_keys=("agents.extract_hold_descriptions",)),
     _video("extract_hold_crops", "modal",
            deps=("extract_bkg_plate", "extract_hold_proposals", "extract_hold_descriptions"),
            config_keys=("models.marigold_v2",), pins=("MARIGOLD_V2_REF",)),
@@ -98,7 +96,7 @@ STAGES: dict[str, Stage] = {s.name: s for s in [
     # --- global hold catalog (deps = every member video's extract_wall_mesh, which
     #     transitively covers its hold descriptions, crops and contacts) --------------
     Stage(name="curate_hold_catalog", runner="modal", scope="global", root="hold_catalog",
-          config_keys=("hold_catalog", "hold_fit", *_AGENT_CFG),
+          config_keys=("hold_catalog", "hold_fit", "agents.curate_hold_catalog"),
           code=("jobs/curate_hold_catalog", "common/hold_fit.py")),
 
     # --- dataset flow: reconstruction ---------------------------------------------

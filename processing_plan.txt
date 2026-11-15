@@ -315,6 +315,13 @@ Decisions:
   at the API's per-batch limits). Each batch_id is saved under _batches/ right after
   submitting, so a rerun after a crash re-attaches to the in-flight batch instead of
   paying twice. Batches whose items are all outdated are cancelled.
+- Claude model per agent step (config agents.{step}: model, effort, max_tokens). Each
+  step's key covers only its own section, so switching one step's model reruns only that
+  step and its downstream. filter_video: Haiku 5.5, low effort (easy judgments, every raw
+  video). curate_hold_catalog: Opus 5.5, high effort (one request per cluster).
+  extract_hold_descriptions: Opus 5.5 until a set-of-marks benchmark (hand-labeled
+  plates, Haiku vs Sonnet vs Opus) picks the cheapest model that labels well enough.
+  API calls bill against an Anthropic Console key, not a Claude subscription.
 - Success flags = cache keys (common/stages.py). Each step declares its code paths
   (hashed by AST, so comments/formatting/docstrings don't invalidate), the config fields it
   reads, its model-code pins, and its upstream steps. Its key hashes all of these together

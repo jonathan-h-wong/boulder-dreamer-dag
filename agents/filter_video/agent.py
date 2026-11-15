@@ -39,11 +39,11 @@ def build_params(video_id: str, config: dict) -> dict:
     ]
     content.append({"type": "text", "text": build_filter_prompt(video_id, len(frames))})
     return {
-        "model": config["agents"]["model"],
-        "max_tokens": config["agents"]["max_tokens"],
+        "model": config["agents"]["filter_video"]["model"],
+        "max_tokens": config["agents"]["filter_video"]["max_tokens"],
         "system": SYSTEM_PROMPT,
         "messages": [{"role": "user", "content": content}],
-        "output_config": output_config(FilterJudgment, config["agents"].get("effort")),
+        "output_config": output_config(FilterJudgment, config["agents"]["filter_video"].get("effort")),
     }
 
 

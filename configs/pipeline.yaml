@@ -65,7 +65,16 @@ hold_fit:                        # common/hold_fit.py — shared by catalog + sc
   iterations: 300
   lr: 0.01
 
-agents:
-  model: "claude-opus-5-5"
-  effort: "medium"               # thinking depth; Opus 5.5 always thinks, effort is the dial
-  max_tokens: 16000              # room for thinking + a full hold list; truncation = failure
+agents:                          # one section per agent stage; each stage hashes only its own
+  filter_video:                  # easy yes/no judgments over 8 frames, all ~29.5k videos
+    model: "claude-haiku-5-5"
+    effort: "low"                # thinking depth; 5.5 models think adaptively, effort is the dial
+    max_tokens: 4000             # truncation = failure (retried next run)
+  extract_hold_descriptions:     # set-of-marks labeling; model pending the benchmark
+    model: "claude-opus-5-5"
+    effort: "medium"
+    max_tokens: 16000            # room for thinking + a full hold list
+  curate_hold_catalog:           # one shape-program request per cluster: hardest, fewest calls
+    model: "claude-opus-5-5"
+    effort: "high"
+    max_tokens: 32000

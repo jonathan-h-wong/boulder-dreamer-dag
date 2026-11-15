@@ -246,8 +246,14 @@ with prefect_test_harness():
     finally:
         p.write_text(orig); st.code_hash.cache_clear()
 
+    # 7b. per-stage agent config: changing the filter model touches nothing in the dataset
+    dataset_flow(config_path=str(CFG))   # settle the rerun from restoring the code in 7
+    config["agents"]["filter_video"]["model"] = "claude-sonnet-5-5"; write_cfg(); calls.clear()
+    dataset_flow(config_path=str(CFG))
+    check("filter model change leaves dataset stages cached", not calls)
+
     # 8. batch resume: crash while polling, rerun re-attaches without resubmitting
-    config["agents"]["max_tokens"] = 8000; write_cfg()   # invalidates hold descriptions
+    config["agents"]["extract_hold_descriptions"]["max_tokens"] = 8000; write_cfg()   # invalidates hold descriptions
     fb = fake.messages.batches
     fb.hang = True
     created_before = fb.created
@@ -264,14 +270,14 @@ with prefect_test_harness():
     check("downstream of hold descriptions reran", "extract_hold_crops" in set(s for s, _ in calls))
 
     # 9. stale in-flight batch is cancelled, not collected
-    config["agents"]["max_tokens"] = 9000; write_cfg()
+    config["agents"]["extract_hold_descriptions"]["max_tokens"] = 9000; write_cfg()
     fb.hang = True
     try:
         dataset_flow(config_path=str(CFG))
     except BaseException:
         pass
     stale_id = f"msgbatch_{fb.created}"
-    config["agents"]["max_tokens"] = 9500; write_cfg(); fb.hang = False
+    config["agents"]["extract_hold_descriptions"]["max_tokens"] = 9500; write_cfg(); fb.hang = False
     dataset_flow(config_path=str(CFG))
     check("stale in-flight batch cancelled", stale_id in fb.cancelled)
 
@@ -297,7 +303,7 @@ with prefect_test_harness():
     check("filter request carries structured-output schema + effort",
           req["output_config"]["format"]["type"] == "json_schema"
           and req["output_config"]["format"]["schema"].get("additionalProperties") is False
-          and req["output_config"]["effort"] == "medium")
+          and req["output_config"]["effort"] == "low" and req["model"] == "claude-haiku-5-5")
 
     climber = json.loads(s3.get_object(Bucket=BUCKET, Key="processed/v2/climber.json")["Body"].read())
     check("climber.json from latest scrape", climber == {"height_cm": 180.3, "ape_index_cm": None})
