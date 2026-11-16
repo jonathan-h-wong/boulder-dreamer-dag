@@ -2,7 +2,7 @@
 
 import modal
 
-from common.modal_images import cpu_base
+from common.modal_images import SECRETS, cpu_base
 from common.modal_jobs import app_name
 
 app = modal.App(app_name("extract_bkg_plate"))
@@ -10,7 +10,7 @@ app = modal.App(app_name("extract_bkg_plate"))
 
 @app.function(
     image=cpu_base,
-    secrets=[modal.Secret.from_name("boulderdreamer-secrets")],
+    secrets=SECRETS,
     cpu=4,
     timeout=900,
 )

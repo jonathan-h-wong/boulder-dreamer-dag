@@ -2,7 +2,7 @@
 
 import modal
 
-from common.modal_images import cpu_geometry, WEIGHTS_MOUNT, weights_volume
+from common.modal_images import SECRETS, cpu_geometry, WEIGHTS_MOUNT, weights_volume
 from common.modal_jobs import app_name
 
 app = modal.App(app_name("extract_grounded_poses"))
@@ -10,7 +10,7 @@ app = modal.App(app_name("extract_grounded_poses"))
 
 @app.function(
     image=cpu_geometry,
-    secrets=[modal.Secret.from_name("boulderdreamer-secrets")],
+    secrets=SECRETS,
     volumes={WEIGHTS_MOUNT: weights_volume},
     cpu=8,
     timeout=1800,

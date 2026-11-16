@@ -13,8 +13,9 @@ exported image.
 Model weights live on the `boulderdreamer-weights` Volume mounted at WEIGHTS_MOUNT,
 not in the images. HF_HOME / TORCH_HOME point there so hub downloads are cached
 across runs. Licensed assets (SMPL / SMPL-X body models, GVHMR checkpoints) must be
-uploaded once by hand, e.g.:
-    modal volume put boulderdreamer-weights ./body_models /body_models
+uploaded once by hand (create the volume first: `modal volume create boulderdreamer-weights`):
+    /body_models/smplx/SMPLX_{NEUTRAL,MALE,FEMALE}.npz
+    /gvhmr/{gvhmr,hmr2,vitpose,yolo}/...   (GVHMR's inputs/checkpoints layout)
 """
 
 import modal
@@ -23,6 +24,13 @@ from common.pins import GVHMR_REF, MARIGOLD_V2_REF, MOGE_REF, SAM2_REF
 
 WEIGHTS_MOUNT = "/weights"
 weights_volume = modal.Volume.from_name("boulderdreamer-weights", create_if_missing=True)
+
+# Credentials, one Modal Secret per provider. Every job attaches all of them:
+# aws-secret          AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION
+# huggingface-secret  HF_TOKEN
+# anthropic-secret    ANTHROPIC_API_KEY
+SECRET_NAMES = ("aws-secret", "huggingface-secret", "anthropic-secret")
+SECRETS = [modal.Secret.from_name(n) for n in SECRET_NAMES]
 
 _CACHE_ENV = {
     "HF_HOME": f"{WEIGHTS_MOUNT}/hf",

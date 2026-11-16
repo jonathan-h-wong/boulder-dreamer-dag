@@ -2,7 +2,7 @@
 
 import modal
 
-from common.modal_images import gpu_gvhmr, WEIGHTS_MOUNT, weights_volume
+from common.modal_images import SECRETS, gpu_gvhmr, WEIGHTS_MOUNT, weights_volume
 from common.modal_jobs import app_name
 
 app = modal.App(app_name("extract_poses"))
@@ -10,7 +10,7 @@ app = modal.App(app_name("extract_poses"))
 
 @app.function(
     image=gpu_gvhmr,
-    secrets=[modal.Secret.from_name("boulderdreamer-secrets")],
+    secrets=SECRETS,
     volumes={WEIGHTS_MOUNT: weights_volume},
     gpu="A10G",
     timeout=3600,

@@ -2,7 +2,7 @@
 
 import modal
 
-from common.modal_images import cpu_geometry
+from common.modal_images import SECRETS, cpu_geometry
 from common.modal_jobs import app_name
 
 app = modal.App(app_name("post_processing"))
@@ -10,7 +10,7 @@ app = modal.App(app_name("post_processing"))
 
 @app.function(
     image=cpu_geometry,
-    secrets=[modal.Secret.from_name("boulderdreamer-secrets")],
+    secrets=SECRETS,
     cpu=4,
     timeout=900,
 )
