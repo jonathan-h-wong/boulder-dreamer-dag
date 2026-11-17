@@ -1,6 +1,6 @@
 """
 extract_scenegraph logic — fits this video's on-route holds with the same procedure as
-the catalog (common/hold_fit.py), so parameters are directly comparable.
+the catalog (jobs/hold_fit.py), so parameters are directly comparable.
 
 Steps:
 1. Load hold_descriptions.csv + hold_contacts.csv (on_route, mounted_on), hold_crops,
@@ -21,5 +21,5 @@ Steps:
 
 
 def run(video_id: str, config: dict):
-    # TODO: implement (fitting lives in common/hold_fit.py)
+    # TODO: implement (fitting lives in jobs/hold_fit.py)
     raise NotImplementedError

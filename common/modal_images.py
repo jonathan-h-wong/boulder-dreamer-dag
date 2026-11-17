@@ -18,6 +18,8 @@ uploaded once by hand (create the volume first: `modal volume create boulderdrea
     /gvhmr/{gvhmr,hmr2,vitpose,yolo}/...   (GVHMR's inputs/checkpoints layout)
 """
 
+from pathlib import Path
+
 import modal
 
 from common.pins import GVHMR_REF, MARIGOLD_V2_REF, MOGE_REF, SAM2_REF
@@ -121,7 +123,7 @@ gpu_marigold = _with_src(
     )
 )
 
-# Hold fitting (common/hold_fit.py): differentiable SDF ray marching in plain torch.
+# Hold fitting (jobs/hold_fit.py): differentiable SDF ray marching in plain torch.
 # Shared by curate_hold_catalog and extract_scenegraph so both fit with identical code;
 # the catalog also needs clustering, the text encoder and the Claude SDK. Normal
 # supervision reuses extract_hold_crops' bkg_normals.png, so no Marigold here.
@@ -143,4 +145,21 @@ gpu_gvhmr = _with_src(
         "cd /opt/GVHMR && pip install -r requirements.txt && pip install -e .",
     )
     .pip_install("boto3", "pydantic>=2.0")
+)
+
+# ---------------------------------------------------------------------------
+# Orchestrator image (scripts/run_flow_on_modal.py): runs a Prefect flow, which only
+# dispatches work (S3 reads, Modal calls, Claude batches), so no ML packages. Python 3.12
+# must match the local .venv: cache keys hash Python ASTs, which can differ across
+# Python versions. Also ships flows/ and the config, which job images don't need.
+# ---------------------------------------------------------------------------
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
+orchestrator = (
+    modal.Image.debian_slim(python_version="3.12")
+    .pip_install("prefect==3.9.3", "anthropic==2.8.0", "modal==1.6.4", "pyyaml", "boto3",
+                 "pydantic>=2.0", "numpy")
+    .env({"PREFECT_HOME": "/tmp/prefect", "PREFECT_SERVER_ALLOW_EPHEMERAL_MODE": "true"})
+    .add_local_file(_REPO_ROOT / "configs" / "pipeline.yaml", "/root/configs/pipeline.yaml")
+    .add_local_python_source("common", "jobs", "agents", "flows")
 )

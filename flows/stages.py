@@ -58,7 +58,7 @@ def _video(name, runner, root="processed", **kw) -> Stage:
 STAGES: dict[str, Stage] = {s.name: s for s in [
     # --- filter flow -----------------------------------------------------------
     _video("extract_filter_frames", "modal", root="filtered_videos",
-           deps=("raw_video",), config_keys=("filter.n_frames",)),
+           deps=("raw_video",), config_keys=("filter.n_frames", "filter.max_side_px", "filter.jpeg_quality")),
     _video("filter_video", "agent", root="filtered_videos",
            deps=("extract_filter_frames",), config_keys=("agents.filter_video",)),
 
@@ -97,7 +97,7 @@ STAGES: dict[str, Stage] = {s.name: s for s in [
     #     transitively covers its hold descriptions, crops and contacts) --------------
     Stage(name="curate_hold_catalog", runner="modal", scope="global", root="hold_catalog",
           config_keys=("hold_catalog", "hold_fit", "agents.curate_hold_catalog"),
-          code=("jobs/curate_hold_catalog", "common/hold_fit.py")),
+          code=("jobs/curate_hold_catalog", "jobs/hold_fit.py")),
 
     # --- dataset flow: reconstruction ---------------------------------------------
     _video("extract_scenegraph", "modal",
@@ -105,7 +105,7 @@ STAGES: dict[str, Stage] = {s.name: s for s in [
                  "extract_hold_crops", "extract_hold_contacts", "extract_wall_mesh",
                  "hold_catalog"),   # normals come from extract_hold_crops' bkg_normals
            config_keys=("hold_fit",),
-           code=("jobs/extract_scenegraph", "common/hold_fit.py")),
+           code=("jobs/extract_scenegraph", "jobs/hold_fit.py")),
 
     # --- dataset flow: grounding --------------------------------------------------
     _video("post_processing", "modal",

@@ -8,7 +8,7 @@ that fails a stage simply drops out of downstream stages for this run; rerunning
 flow retries only what isn't current.
 
 Skip logic: a (stage, video) is skipped when its marker's cache_key equals the key
-computed now (common/stages.py). Keys are computed here, by the orchestrator, because
+computed now (flows/stages.py). Keys are computed here, by the orchestrator, because
 only it sees the whole DAG; Modal jobs write their own marker after their outputs.
 """
 
@@ -33,13 +33,27 @@ from prefect.cache_policies import NO_CACHE
 from common.idempotency import marker_key, marker_spec, read_marker
 from common.modal_jobs import job_fn
 from common.s3 import get_client
-from common.stages import EXTERNAL_INPUTS, REPO_ROOT, STAGES, KeyResolver, cache_key, lineage
+from flows.stages import EXTERNAL_INPUTS, REPO_ROOT, STAGES, KeyResolver, cache_key, lineage
 
 S3_WORKERS = 32  # parallel marker reads / HEADs
 
 
+def load_dotenv(path=None) -> None:
+    """KEY=VALUE lines from the git-ignored repo-root .env, for local orchestrator runs
+    (e.g. ANTHROPIC_API_KEY). Never overrides variables already set in the environment."""
+    path = path or REPO_ROOT / ".env"
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
 def load_config(config_path: str) -> dict:
-    with open(REPO_ROOT / config_path) as f:
+    load_dotenv()
+    with open(REPO_ROOT / config_path, encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
@@ -182,7 +196,10 @@ def list_raw_inputs(config: dict, s3) -> dict[str, dict]:
     rows = load_climber_metadata(config, s3)
     for vid, d in inputs.items():
         info = climber_info(rows.get(vid))
+        row = rows.get(vid)
         d["climber"] = info
+        d["gym"] = row.get("gym_slug") if row else None   # reporting only; not in any key
+        d["has_metadata_row"] = row is not None
         d["metadata"] = (hashlib.sha256(json.dumps(info, sort_keys=True).encode()).hexdigest()[:16]
                          if info else None)
     return inputs
@@ -237,7 +254,7 @@ def run_modal_stage(ctx: Context, stage: str, video_ids: list[str] | None = None
         specs = [ctx.marker_spec(stage, v) for v in todo]
         results = job_fn(stage).map(
             todo, specs, kwargs={"config": ctx.config},
-            return_exceptions=True, wrap_returned_exceptions=False,
+            return_exceptions=True,   # returned as-is (Modal >=1.6 no longer wraps them)
         )
         for vid, res in zip(todo, results):
             if isinstance(res, BaseException):
@@ -294,20 +311,27 @@ def write_climber_info(ctx: Context, video_ids: list[str]) -> None:
 # ---------------------------------------------------------------------------
 
 @task(cache_policy=NO_CACHE)
-def ensure_hold_catalog(ctx: Context, rebuild: bool = False) -> str:
+def ensure_hold_catalog(ctx: Context, rebuild: bool = False,
+                        build_if_missing: bool = True) -> str | None:
     """
     Make ctx.catalog_key available to downstream stages.
 
     The catalog is an explicit snapshot: without `rebuild`, the existing catalog is used
     as-is even if new videos have arrived (they query it, they aren't in it). With
-    `rebuild` (or if none exists), it is rebuilt from every video whose extract_wall_mesh
-    is current (its frames are the fitting init; its key covers holds, crops, contacts); its key covers those members' keys, so any change in membership or
-    upstream holds yields a new key — and invalidates every downstream scenegraph.
+    `rebuild` (or if none exists and build_if_missing), it is rebuilt from every video
+    whose extract_wall_mesh is current (its frames are the fitting init; its key covers
+    holds, crops, contacts). The catalog key covers those members' keys, so any change in
+    membership or upstream holds yields a new key — and invalidates every downstream
+    scenegraph. Returns None when there is no catalog and building one wasn't allowed.
     """
     log = get_run_logger()
     stage = "curate_hold_catalog"
     key = marker_key(ctx.prefix("hold_catalog"), stage)
     existing = read_marker(ctx.s3, ctx.bucket, key)
+
+    if existing is None and not rebuild and not build_if_missing:
+        log.info(f"[{stage}] no catalog exists and building one was not requested")
+        return None
 
     if existing and not rebuild:
         ctx.catalog_key = existing["cache_key"]

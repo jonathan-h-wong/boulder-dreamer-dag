@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, TypeVar
@@ -34,6 +35,8 @@ M = TypeVar("M", bound=BaseModel)
 # API limits are 100k requests / 256 MB per batch; stay under with margin.
 MAX_REQUESTS_PER_BATCH = 50_000
 MAX_BYTES_PER_BATCH = 200 * 1024 * 1024
+IO_WORKERS = 32          # build_params / handle_result are S3-bound
+IO_WINDOW = 256          # items in flight at once (bounds request memory)
 
 
 def get_client() -> anthropic.Anthropic:
@@ -136,18 +139,26 @@ def run_batch_stage(
         log(f"[{stage}] submitted batch {batch.id} with {len(chunk)} requests")
         chunk, chunk_bytes = [], 0
 
-    for n, item in enumerate(to_submit):
+    def build(item):
         try:
-            params = build_params(item, config)
+            return build_params(item, config), None
         except Exception as e:  # missing upstream file etc. — skip this item only
-            outcome.failed[item] = f"build_params: {e!r}"
-            continue
-        size = len(json.dumps(params))
-        if chunk and (len(chunk) >= MAX_REQUESTS_PER_BATCH
-                      or chunk_bytes + size > MAX_BYTES_PER_BATCH):
-            flush()
-        chunk.append((f"r{n}", item, params))
-        chunk_bytes += size
+            return None, f"build_params: {e!r}"
+
+    with ThreadPoolExecutor(IO_WORKERS) as pool:
+        for start in range(0, len(to_submit), IO_WINDOW):
+            window = to_submit[start:start + IO_WINDOW]
+            for n, item, (params, err) in zip(range(start, start + len(window)), window,
+                                              pool.map(build, window)):
+                if err:
+                    outcome.failed[item] = err
+                    continue
+                size = len(json.dumps(params))
+                if chunk and (len(chunk) >= MAX_REQUESTS_PER_BATCH
+                              or chunk_bytes + size > MAX_BYTES_PER_BATCH):
+                    flush()
+                chunk.append((f"r{n}", item, params))
+                chunk_bytes += size
     flush()
 
     # 3. Poll every pending batch to completion, then collect results.
@@ -157,21 +168,37 @@ def run_batch_stage(
             batch = client.messages.batches.retrieve(rec["batch_id"])
             if batch.processing_status != "ended":
                 continue
-            for result in client.messages.batches.results(rec["batch_id"]):
+            def collect(result, batch_id=rec["batch_id"], rec=rec):
                 entry = rec["items"].get(result.custom_id)
                 if entry is None or not is_current(entry):
-                    continue  # stale result: never let it overwrite current outputs
+                    return None  # stale result: never let it overwrite current outputs
                 item = entry["item"]
                 if result.result.type != "succeeded":
-                    outcome.failed[item] = f"batch result {result.result.type}"
-                    continue
+                    return item, f"batch result {result.result.type}"
                 try:
                     handle_result(item, result.result.message, config)
                 except Exception as e:
-                    outcome.failed[item] = f"handle_result: {e!r}"
-                    continue
-                write_marker(items[item], client=s3, batch_id=rec["batch_id"])
-                outcome.succeeded.add(item)
+                    return item, f"handle_result: {e!r}"
+                write_marker(items[item], client=s3, batch_id=batch_id)
+                return item, None
+
+            window = []
+            with ThreadPoolExecutor(IO_WORKERS) as pool:
+                def drain():
+                    for res in pool.map(collect, window):
+                        if res is None:
+                            continue
+                        item, err = res
+                        if err:
+                            outcome.failed[item] = err
+                        else:
+                            outcome.succeeded.add(item)
+                    window.clear()
+                for result in client.messages.batches.results(rec["batch_id"]):
+                    window.append(result)
+                    if len(window) >= IO_WINDOW:
+                        drain()
+                drain()
             s3.delete_object(Bucket=bucket, Key=key)
             del waiting[key]
         if waiting:

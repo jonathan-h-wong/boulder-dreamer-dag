@@ -1,6 +1,6 @@
 """
 Pinned upstream commits for git-installed model code. Bump deliberately: stages that
-declare a pin (common/stages.py) fold it into their cache key, so bumping a pin
+declare a pin (flows/stages.py) fold it into their cache key, so bumping a pin
 invalidates exactly those stages and everything downstream of them.
 """
 

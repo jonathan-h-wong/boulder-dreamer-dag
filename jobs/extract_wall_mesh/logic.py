@@ -7,7 +7,7 @@ holds/hold_contacts.csv (on_route, mounted_on), holds/hold_crops/segmentation/.
 Steps:
 1. Bare-wall depth: inpaint (linear interpolation) the depth under EVERY hold and volume
    mask -> bare_wall_depth.npy. This is the surface hold frames sit on.
-2. Hold frames (the fitting init for common/hold_fit.py, used by both the catalog and
+2. Hold frames (the fitting init for jobs/hold_fit.py, used by both the catalog and
    the scenegraph): for each hold,
      origin  = mask centroid lifted onto the bare-wall surface with K
      normal  = local plane fit of the bare wall around the hold; for a hold with

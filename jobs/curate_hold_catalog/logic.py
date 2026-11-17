@@ -19,7 +19,7 @@ Pipeline:
 4. For each cluster: sample up to 50 farthest-point samples
 5. Claude agent: feed {RGB, Normal} crops + schema descriptions ->
    generate procedural program for hold shape (SDF / parametric params)
-6. Fit with common/hold_fit.py (the same procedure extract_scenegraph uses): frames from
+6. Fit with jobs/hold_fit.py (the same procedure extract_scenegraph uses): frames from
    hold_frames.json, extrinsic residuals + intrinsics fitted, accepted at
    hold_fit.min_score. Exemplars first (to settle each cluster's program), then every
    remaining member hold, warm-started from its cluster's exemplars.

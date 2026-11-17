@@ -86,6 +86,8 @@ class FakeFn:
             raise RuntimeError(f"boom {self.stage} {vid}")
         if self.stage == "extract_filter_frames":
             s3.put_object(Bucket=BUCKET, Key=f"filtered_videos/{vid}/frames/0000.jpg", Body=b"jpg")
+            s3.put_object(Bucket=BUCKET, Key=f"filtered_videos/{vid}/video_info.json",
+                          Body=json.dumps({"camera_motion_px": 1.5, "duration_s": 10.0}).encode())
         if self.stage == "extract_bkg_plate":
             s3.put_object(Bucket=BUCKET, Key=f"processed/{vid}/bkg_rgb.png", Body=b"png")
         if self.stage == "extract_hold_proposals":
@@ -180,14 +182,48 @@ DEPTH_DOWNSTREAM = {"extract_depth", "extract_poses", "extract_hold_contacts",
                     "post_processing"}
 with prefect_test_harness():
     # 1. filter
-    passing = filter_flow(config_path=str(CFG))
+    summary = filter_flow(config_path=str(CFG))
+    passing = json.loads(s3.get_object(Bucket=BUCKET, Key="filtered_videos/passing_video_ids.json")["Body"].read())
     check("filter: v3 rejected for missing metadata, v1/v2 pass", passing == ["v1", "v2"])
+    import csv as _csv0, io as _io0
+    table = {r["video_id"]: r for r in _csv0.DictReader(_io0.StringIO(s3.get_object(
+        Bucket=BUCKET, Key="filtered_videos/filter_results.csv")["Body"].read().decode()))}
+    check("filter: results table has a row per video with status",
+          {v: r["status"] for v, r in table.items()} == {"v1": "passed", "v2": "passed", "v3": "rejected"}
+          and table["v3"]["missing_climber_metadata"] == "true")
+    runs = s3.list_objects_v2(Bucket=BUCKET, Prefix="filtered_videos/_runs/").get("Contents", [])
+    check("filter: run summary written", len(runs) == 1 and summary["passed"] == 2
+          and summary["rejections_by_criterion"]["missing_climber_metadata"] == 1)
+    summary = filter_flow(config_path=str(CFG), video_ids=["v1"])
+    check("filter: subset run keeps other rows; no new Claude batch",
+          summary["total"] == 3 and summary["passed"] == 2 and fake.messages.batches.created == 1)
+    config["filter"]["max_camera_motion_px"] = 1.0; write_cfg(); calls.clear()
+    summary = filter_flow(config_path=str(CFG))
+    check("filter: motion threshold applies at aggregation (no rerun, no new batch)",
+          summary["passed"] == 0 and summary["rejections_by_criterion"]["camera_motion"] == 2
+          and not calls and fake.messages.batches.created == 1)
+    config["filter"]["max_camera_motion_px"] = 4.0; write_cfg()
+    summary = filter_flow(config_path=str(CFG))
+    check("filter: restoring the threshold restores passes", summary["passed"] == 2)
     check("filter: one Claude batch for all videos", fake.messages.batches.created == 1
           and len(fake.messages.batches.batches["msgbatch_1"]) == 2)
+    FAIL.add(("extract_filter_frames", "v1"))
+    config["filter"]["jpeg_quality"] = 80; write_cfg()     # reruns frames for v1/v2
+    summary = filter_flow(config_path=str(CFG))
+    check("filter: failed frame extraction -> not_evaluated with reason",
+          summary["not_evaluated"] == 1 and summary["passed"] == 1
+          and any(r.startswith("frame extraction:") for r in summary["not_evaluated_reasons"]))
+    FAIL.discard(("extract_filter_frames", "v1"))
+    summary = filter_flow(config_path=str(CFG))
+    check("filter: retry evaluates it", summary["passed"] == 2 and summary["not_evaluated"] == 0)
 
     # 2. first dataset run, with depth failing for v2
     FAIL.add(("extract_depth", "v2"))
     dataset_flow(config_path=str(CFG))
+    check("no catalog: stops at the barrier (wall mesh done, no catalog/scenegraph)",
+          ran("extract_wall_mesh") == ["v1"] and ("curate_hold_catalog", "global") not in calls
+          and not ran("extract_scenegraph") and not ran("post_processing"))
+    dataset_flow(config_path=str(CFG), rebuild_catalog=True)
     check("failure isolation: v2 stops after depth, v1 completes",
           ran("post_processing") == ["v1"] and ran("extract_grounded_poses") == ["v1"])
     check("independent stages still ran for v2", ran("extract_hold_crops") == ["v1", "v2"])
@@ -232,7 +268,7 @@ with prefect_test_harness():
           set(s for s, _ in calls) == {"curate_hold_catalog", "extract_scenegraph", "post_processing"})
 
     # 7. code change (comments-only vs semantic)
-    from common import stages as st
+    from flows import stages as st
     p = REPO / "jobs/extract_wall_mesh/logic.py"
     orig = p.read_text()
     try:

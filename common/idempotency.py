@@ -6,7 +6,7 @@ Layout (one JSON file per stage per video, next to that video's outputs):
     {root}_markers/{stage}.json                  global stages (hold catalog)
 
 A stage is *current* when its marker exists and marker["cache_key"] equals the key the
-orchestrator computes now (common/stages.py). A stale marker is simply overwritten on
+orchestrator computes now (flows/stages.py). A stale marker is simply overwritten on
 the next successful run — nothing has to be cleared by hand.
 
 Who writes:

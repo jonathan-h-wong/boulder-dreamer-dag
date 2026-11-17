@@ -13,9 +13,18 @@ All pipeline outputs below are siblings of raw/ and state/ in the same bucket.
 1) Video Filtering
 filtered_videos/
   |-- passing_video_ids.json
+  |-- filter_results.csv          one row per filtered video: gym, status (passed / rejected /
+  |                               not_evaluated), each criterion, notes, duration, size
+  |-- _runs/{utc_ts}.json         append-only filter log: summary after each run (counts
+  |                               per criterion, sole-reason counts, per-gym pass rates,
+  |                               not-evaluated reasons) + run scope, git sha, model
   |-- {video_id}/
-    |-- frames/
+    |-- frames/{nn}.jpg           8 frames at the centers of 8 equal time slices, <=768 px
+    |-- video_info.json           fps, frame count, duration, width, height
     |-- filter_result.json
+
+filter_flow(sample=N, seed=0) filters a seeded random subset (same seed = same videos);
+a subset run updates only its own rows, and the summary covers every video filtered so far.
 
 - filter_video.py (CPU batch job with sparse agent calls)
   Videos without height_cm are rejected up front, without a Claude request.
@@ -27,6 +36,12 @@ filtered_videos/
   Discard videos in which camera is too blurry/goes out of focus.
   - Moving Camera: Downstream analysis assumes a static camera to retrieve background plate via median filtering.
   Discard videos with a moving camera.
+  Judged twice; either rejects: by Claude, and by a measured check. ORB features of each
+  sampled frame are matched to the first frame and a similarity transform is fitted with
+  RANSAC (the climber falls out as outliers). camera_motion_px = largest image-corner
+  displacement; reject above filter.max_camera_motion_px (4 px at 768 px). On a
+  300-video sample Claude missed slow pans that follow the climber, which the measured
+  check catches. The threshold is applied at aggregation, so changing it costs nothing.
   - Contains floor plane: Floor plane is necessary to establish a gravity-aligned world frame.
   Discard videos that do not contain the floor.
   - Climber height metadata:
@@ -100,7 +115,7 @@ into Claude for procedural program generation. Optimized fit of extrinsic wall t
 and intrinsic shape parameters should be greater than 80%. Loss is some combination of segmentation IoU and normal alignment.
 With procedural program settled, fit all remaining holds, exporting only the intrinsic parameters.
 
-Shared fitting procedure (common/hold_fit.py): the catalog and extract_scenegraph fit
+Shared fitting procedure (jobs/hold_fit.py): the catalog and extract_scenegraph fit
 holds with the SAME code, so catalog parameters and scenegraph parameters mean the same
 thing. Both hash it into their cache keys; changing it invalidates both together.
   - Frame (fixed, from extract_wall_mesh's hold_frames.json): origin = mask centroid on
@@ -177,7 +192,7 @@ Order:
            -> poses (needs depth's intrinsics) | hold_proposals (needs only the plate)
   Stage 2: hold_descriptions -> hold_crops | hold_contacts | grounded_poses
            -> wall_mesh (+ bare-wall depth, hold frames)
-  -> hold catalog barrier (section 2; fits with common/hold_fit.py)
+  -> hold catalog barrier (section 2; fits with jobs/hold_fit.py)
   Stage 3: scenegraph (same hold_fit procedure, warm-started from the catalog)
   Stage 4: post_processing
   -> optional release manifest
@@ -200,7 +215,7 @@ All steps here take a downsampling rate.
     - Since K is shared, extract_grounded_poses only needs to solve for scale and
       translation between the GVHMR body and the depth maps.
 
-Stage 2: Hold Perception
+Stage 2: Route Perception
 Depends on clean plate, intrinsics, poses.
 Also the sole input to the global hold catalog (section 2).
 Localization comes from SAM2 and semantics from Claude ("set-of-marks"); Claude never
@@ -272,7 +287,7 @@ Depends on annotated holds, wall_mesh, hold catalog
     - Query for touched holds, construct embedding for hold types (same construction as
     the catalog), warm start intrinsics from prefit knn parameters; extrinsics start from
     this hold's own frame in hold_frames.json.
-    - Fit with common/hold_fit.py, the same procedure the catalog uses:
+    - Fit with jobs/hold_fit.py, the same procedure the catalog uses:
     differentiable SDF ray marching for depth and normals.
     Supervision (all real observations, untouched holds excluded from the loss window):
     - Normal Map: bkg_normals.png (Marigold V2, from extract_hold_crops)
@@ -322,7 +337,7 @@ Decisions:
   extract_hold_descriptions: Opus 5.5 until a set-of-marks benchmark (hand-labeled
   plates, Haiku vs Sonnet vs Opus) picks the cheapest model that labels well enough.
   API calls bill against an Anthropic Console key, not a Claude subscription.
-- Success flags = cache keys (common/stages.py). Each step declares its code paths
+- Success flags = cache keys (flows/stages.py). Each step declares its code paths
   (hashed by AST, so comments/formatting/docstrings don't invalidate), the config fields it
   reads, its model-code pins, and its upstream steps. Its key hashes all of these together
   with the upstream steps' keys, so keys chain: any change invalidates exactly that step

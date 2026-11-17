@@ -7,8 +7,9 @@ Dataset Flow — stage-major processing of every filtered video.
   2. Hold perception      hold_descriptions                 (one Claude batch, all videos)
                           hold_crops | hold_contacts | grounded_poses   (concurrent)
                           wall_mesh                         (+ bare-wall depth, hold frames)
-  -- barrier --           hold catalog                      (reuse, or build/rebuild; fits
-                                                             with common/hold_fit.py)
+  -- barrier --           hold catalog                      (reuse an existing one, or
+                                                             rebuild with rebuild_catalog;
+                                                             fits with jobs/hold_fit.py)
   3. Reconstruction       scenegraph                        (same hold_fit procedure,
                                                              warm-started from the catalog)
   4. Grounding            post_processing                   (Modal map)
@@ -16,6 +17,11 @@ Dataset Flow — stage-major processing of every filtered video.
 
 Each stage runs only on videos whose upstream stages are current, and skips videos
 whose marker already matches the computed cache key.
+
+If no hold catalog exists yet, the flow stops at the barrier instead of building one, so
+the catalog can be inspected before anything is fitted against it: build it with the
+hold-catalog flow (or pass rebuild_catalog=True), then rerun this flow. Everything up to
+the barrier is cached, so the rerun picks up at reconstruction.
 """
 
 import json
@@ -44,8 +50,9 @@ def dataset_flow(
 ):
     """
     video_ids:        subset to process (default: filtered_videos/passing_video_ids.json)
-    rebuild_catalog:  rebuild the global hold catalog from all current videos before
-                      reconstruction (invalidates every scenegraph downstream)
+    rebuild_catalog:  (re)build the global hold catalog from all current videos before
+                      reconstruction (invalidates every scenegraph downstream). Without
+                      it, a missing catalog stops the flow at the barrier.
     release:          if set, write an immutable manifests/{release}.json at the end
     """
     logger = get_run_logger()
@@ -67,7 +74,13 @@ def dataset_flow(
     run_modal_stage(ctx, "extract_wall_mesh")
 
     # Barrier: global hold catalog (fit on the same hold frames the scenegraph uses)
-    ensure_hold_catalog(ctx, rebuild=rebuild_catalog)
+    if ensure_hold_catalog(ctx, rebuild=rebuild_catalog, build_if_missing=False) is None:
+        publish_report(ctx, "dataset-stages")
+        logger.warning(
+            f"Stopped at the hold-catalog barrier: no catalog exists. "
+            f"{len(ctx.ok['extract_wall_mesh'])} videos have a current wall mesh. Build the "
+            "catalog with the hold-catalog flow, inspect it, then rerun this flow.")
+        return
 
     # Stage 3: Reconstruction
     run_modal_stage(ctx, "extract_scenegraph")

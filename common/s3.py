@@ -13,7 +13,9 @@ import io
 
 
 def get_client(region: str = "us-east-1"):
-    return boto3.client("s3", region_name=region)
+    # Callers fan out with thread pools; match the pool to avoid discarded connections.
+    from botocore.config import Config
+    return boto3.client("s3", region_name=region, config=Config(max_pool_connections=64))
 
 
 def s3_path(bucket: str, *parts: str) -> str:
