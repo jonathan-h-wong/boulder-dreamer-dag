@@ -95,9 +95,13 @@ anthropic.transform_schema), then re-validated with the same model, which also c
 limits the API schema can't express (e.g. max length). Truncated or refused responses
 count as failures and are retried on the next run.
 Claude only outputs what it judges; ids, coordinates and derived flags are added in code.
-  - extract_hold_descriptions -> HoldLabelResponse
-      holds: [HoldLabel{mark_ids, hold_type, outline, profile, lip, opening, symmetry,
-              relative_size, depth_class, description}], non_hold_marks: [int]
+  - detect_holds -> HoldDetectionResponse
+      holds: [{mark_ids}], non_hold_marks: [int]
+  - extract_hold_descriptions -> HoldDescriptionResponse
+      holds: [{hold (number from the overlay), hold_type, outline, profile, lip, opening,
+              symmetry, relative_size, depth_class, description}]
+    joined in code into HoldLabelResponse (hold_labels.json):
+      holds: [HoldLabel{mark_ids, ...fields}], non_hold_marks: [int]
   - filter_video -> FilterJudgment
       {too_many_climbers, camera_blur, moving_camera, no_floor_plane, notes}
       (passed and missing_climber_metadata are computed in code)
@@ -166,8 +170,9 @@ processed/
     |-- climber.json      (height_cm, ape_index_cm; staged by the orchestrator)
 
     |-- holds/
-      |-- proposals/{masks.npz, marks.png, marks.json, tiles/}  (SAM2 masks + numbered overlay)
-      |-- hold_labels.json      (agent output, validated)
+      |-- proposals/{masks.npz, marks.png, marks.json, plate.jpg, tiles/}  (SAM2 masks + numbered overlay)
+      |-- hold_detections.json  (detect_holds: which marks are holds, grouped per hold)
+      |-- hold_labels.json      (detections joined with extract_hold_descriptions' fields)
       |-- hold_descriptions.csv (one row per hold: hold_id, mark_ids, bbox, schema fields)
       |-- hold_contacts.csv     (hold_id, on_route, mounted_on, n_contacts, contact_limbs)
       |-- hold_frames.json      (hold_id -> origin, normal, tangent, source; fitting init)
@@ -190,7 +195,7 @@ run only; rerunning retries just what isn't current.
 Order:
   Stage 1: bkg_plate | depth
            -> poses (needs depth's intrinsics) | hold_proposals (needs only the plate)
-  Stage 2: hold_descriptions -> hold_crops | hold_contacts | grounded_poses
+  Stage 2: detect_holds -> hold_descriptions -> hold_crops | hold_contacts | grounded_poses
            -> wall_mesh (+ bare-wall depth, hold frames)
   -> hold catalog barrier (section 2; fits with jobs/hold_fit.py)
   Stage 3: scenegraph (same hold_fit procedure, warm-started from the catalog)
@@ -234,18 +239,39 @@ outputs coordinates. On-route is computed from geometry, not judged from an imag
     - Proposal recall is now a SAM2 tuning question (grid density, min area, crop
       layers); "be comprehensive" moves from the prompt into these parameters.
 
-  Stage 2:
-  - extract_hold_descriptions.py: (Agentic, ONE Claude batch over all videos)
-    Input: clean plate + numbered overlay tiles. Agent prompt:
-    'Each numbered region is a candidate from an automatic segmenter. Identify which
-    numbered regions are climbing holds or volumes. Focus on the holds and volumes on the
-    closest wall the camera is focusing on; regions on further walls are not holds.
-    Be comprehensive: label small footholds, and volumes partially occluded by mounted holds.
-    If one hold or volume spans several regions, list all of their numbers together.
-    For each hold or volume, fill in the schema fields.'
-    Output: HoldLabelResponse (see "Agent output format"). Code assigns hold_id, unions
-    the marks' masks, and computes bbox from them. Every mark must be listed exactly once
-    (in a hold or in non_hold_marks); otherwise the video fails and is retried.
+  Stage 2 (two agent passes, ONE Claude batch each over all videos; Haiku 5.5):
+  - detect_holds: which proposals are holds, and which proposals make up one hold.
+    Input: the clean plate, then one close-up per proposal: a square window centered on
+    the mark (2x its larger bbox side, at least 64 px), enlarged to 224 px, shown as
+    photographed and again with the mark outlined, introduced by its number and position.
+    Small footholds fill their frame instead of hiding under an overlay's outlines.
+    Output: HoldDetectionResponse -> hold_detections.json. Every mark is listed once; a few
+    skipped marks (<= 2%) become non-holds, more fails the video (retried next run).
+  - extract_hold_descriptions: the schema fields for every detected hold.
+    Input: the clean plate plus the standard overlay tiles (one scale for the whole wall),
+    redrawn with only the detected holds outlined and numbered (its smallest mark id), each
+    tile followed by a clean copy; the prompt lists the detected holds and defines the
+    hold types. Close-ups lose scale (every mark fills its frame), so size-dependent
+    judgments (foot chip vs jug, relative_size) are made here, at one scale.
+    Output: HoldDescriptionResponse, joined with the detections into hold_labels.json
+    (HoldLabelResponse); code assigns hold_id, unions the marks' masks, computes the bbox.
+    Every detected hold must be described; otherwise the video fails and is retried.
+  - Why two passes (scratch experiments, Nov 2026: 20 plates, Haiku 5.5, scored per mark
+    against Opus 5.5 high in the original single-pass setup; 19 plates in common):
+                                       hold recall  precision  F1     type agrees w/ Opus
+      single pass, numbered tiles      0.919        0.929      0.924  35%
+      single pass, per tile + clean    0.933        0.954      0.943  38%
+      single pass, close-ups           0.958        0.949      0.954  23%  (scale lost)
+      two pass (close-ups, then types
+        at one scale + definitions)    0.958        0.949      0.954  42%
+      Opus 5.5 medium, single pass     0.972        0.980      0.976  78%
+    Small marks (< ~950 px, mostly footholds): recall 0.874 -> 0.942 with close-ups.
+    Global scale alone barely moved types (23% -> 26%); the written type definitions did
+    (-> 42%). Type disagreements are mostly neighbors (foot chip vs crimp edge, sloper vs
+    jug). Things that did not help: a "when unsure, answer hold" prompt; Marigold normals
+    as extra images (recall unchanged; only fixed wall-scope mistakes on one plate).
+    Cost: ~$0.008/video at batch prices (~$110 for 13.9k videos) vs ~$0.11 for Opus.
+    Reproduce with scripts/benchmark_set_of_marks.py (runs these two passes).
 
   Stage 3 (concurrent):
   - extract_hold_crops.py: (GPU batch job)
@@ -334,8 +360,8 @@ Decisions:
   step's key covers only its own section, so switching one step's model reruns only that
   step and its downstream. filter_video: Haiku 5.5, low effort (easy judgments, every raw
   video). curate_hold_catalog: Opus 5.5, high effort (one request per cluster).
-  extract_hold_descriptions: Opus 5.5 until a set-of-marks benchmark (hand-labeled
-  plates, Haiku vs Sonnet vs Opus) picks the cheapest model that labels well enough.
+  detect_holds + extract_hold_descriptions: Haiku 5.5, medium effort, chosen by the
+  set-of-marks experiments (see Stage 2 of route perception).
   API calls bill against an Anthropic Console key, not a Claude subscription.
 - Success flags = cache keys (flows/stages.py). Each step declares its code paths
   (hashed by AST, so comments/formatting/docstrings don't invalidate), the config fields it

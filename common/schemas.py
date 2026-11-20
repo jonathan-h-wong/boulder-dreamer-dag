@@ -91,15 +91,47 @@ class HoldDepthClass(str, Enum):
 # --- Agent output: what Claude judges. These models generate the structured-output JSON
 # schema (agents.base.output_format) and re-validate the response. They contain no ids or
 # coordinates: those come from SAM2 proposals and are added in code.
+#
+# Hold perception is two passes (two agent stages):
+#   detect_holds               per-mark close-ups -> HoldDetectionResponse (which marks are
+#                              holds, and which marks make up one hold)
+#   extract_hold_descriptions  the whole plate at one scale, detected holds only ->
+#                              HoldDescriptionResponse (the fields per detected hold)
+# The code joins them into HoldLabelResponse (hold_labels.json) and HoldRecord rows.
 
-class HoldLabel(BaseModel):
+_MARK_IDS_DESC = ("Numbers of every region that together make up this one hold or volume "
+                  "(usually one; several if the segmenter split it).")
+
+
+class HoldDetection(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    mark_ids: list[int] = Field(
-        ..., min_length=1,
-        description="Numbers of every overlay region that together make up this one hold or "
-                    "volume (usually one; several if the segmenter split it).",
+    mark_ids: list[int] = Field(..., min_length=1, description=_MARK_IDS_DESC)
+
+
+class HoldDetectionResponse(BaseModel):
+    """Agent output for detect_holds."""
+    model_config = ConfigDict(extra="forbid")
+
+    holds: list[HoldDetection]
+    non_hold_marks: list[int] = Field(
+        ..., description="Numbers of regions that are not holds or volumes on the target wall "
+                         "(bare wall, tape, labels, people, holds on further walls).",
     )
+
+
+class HoldDetections(BaseModel):
+    """detect_holds' validated result (holds/hold_detections.json): every mark exactly once.
+    unaccounted = marks the answer skipped, which count as non-holds."""
+    holds: list[list[int]]
+    non_hold_marks: list[int]
+    unaccounted: list[int] = []
+
+
+class HoldFields(BaseModel):
+    """What the description pass judges for one hold."""
+    model_config = ConfigDict(extra="forbid")
+
     hold_type: HoldType
     outline: HoldOutline
     profile: HoldProfile
@@ -111,8 +143,23 @@ class HoldLabel(BaseModel):
     description: str = Field(..., max_length=300, description="Free text, at most two sentences.")
 
 
+class HoldDescription(HoldFields):
+    hold: int = Field(..., description="The hold's number, as listed and drawn on the overlay.")
+
+
+class HoldDescriptionResponse(BaseModel):
+    """Agent output for extract_hold_descriptions: one entry per detected hold."""
+    model_config = ConfigDict(extra="forbid")
+
+    holds: list[HoldDescription]
+
+
+class HoldLabel(HoldFields):
+    mark_ids: list[int] = Field(..., min_length=1, description=_MARK_IDS_DESC)
+
+
 class HoldLabelResponse(BaseModel):
-    """Agent output for extract_hold_descriptions."""
+    """Detections joined with descriptions (holds/hold_labels.json)."""
     model_config = ConfigDict(extra="forbid")
 
     holds: list[HoldLabel]

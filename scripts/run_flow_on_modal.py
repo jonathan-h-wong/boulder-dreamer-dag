@@ -13,6 +13,7 @@ Modal app logs. Jobs are called by name, so deploy them first (scripts/deploy_jo
                                                                              # the catalog if none exists
     modal run --detach scripts/run_flow_on_modal.py --flow catalog           # build/rebuild it
     modal run --detach scripts/run_flow_on_modal.py --flow dataset --release r1
+    modal run --detach scripts/run_flow_on_modal.py --flow dataset --sample 20 --stages extract_bkg_plate,extract_hold_proposals
 
 --detach keeps the run going if this terminal closes (Claude batches can take hours).
 """
@@ -46,14 +47,16 @@ def run_flow(flow: str, kwargs: dict, git_sha: str):
 
 @app.local_entrypoint()
 def main(flow: str = "filter", sample: int = 0, seed: int = 0,
-         rebuild_catalog: bool = False, release: str = ""):
+         rebuild_catalog: bool = False, release: str = "", stages: str = ""):
     import json
 
     from flows.runtime import git_sha
 
     kwargs = {
         "filter": {"sample": sample or None, "seed": seed},
-        "dataset": {"rebuild_catalog": rebuild_catalog, "release": release or None},
+        "dataset": {"sample": sample or None, "seed": seed, "rebuild_catalog": rebuild_catalog,
+                    "release": release or None,
+                    "stages": [s.strip() for s in stages.split(",") if s.strip()] or None},
         "catalog": {},
     }[flow]
     result = run_flow.remote(flow, kwargs, git_sha())

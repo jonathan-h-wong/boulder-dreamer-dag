@@ -107,20 +107,22 @@ gpu_moge = _with_src(_gpu_torch.pip_install(f"git+https://github.com/microsoft/M
 gpu_sam2 = _with_src(
     _gpu_torch.env({"SAM2_BUILD_CUDA": "0"}).pip_install(
         f"git+https://github.com/facebookresearch/sam2.git@{SAM2_REF}",
+        "huggingface_hub",   # SAM2's from_pretrained; not in its install_requires
     )
 )
 
 # Marigold V2 normals (hold crops): a LoRA on Qwen-Image-Edit-2509, installed from its repo
-# (not on PyPI). The repo's download_assets.py fetches the checkpoints + base model into
-# repo/assets/, which is symlinked to the weights volume so the ~tens-of-GB download
-# happens once. ~17 GB VRAM at 1024^2, ~29 GB at 2048^2.
+# (not on PyPI). Its scripts (download_assets.py, infer.py) read and write assets under
+# $DEPTH_ASSETS_DIR, pointed at the weights volume so the ~71 GB download (Qwen base 54 GB +
+# Marigold checkpoints 17 GB) happens once; already populated there. The repo ships its own
+# assets/ folder, so a symlink in its place would land inside it instead.
+# ~17 GB VRAM at 1024^2, ~29 GB at 2048^2.
 gpu_marigold = _with_src(
     _gpu_torch.run_commands(
         "git clone https://github.com/huawei-bayerlab/marigold-v2.git /opt/marigold-v2"
         f" && cd /opt/marigold-v2 && git checkout {MARIGOLD_V2_REF}",
         "cd /opt/marigold-v2 && pip install -e .",
-        f"mkdir -p {WEIGHTS_MOUNT} && ln -s {WEIGHTS_MOUNT}/marigold-v2-assets /opt/marigold-v2/assets",
-    )
+    ).env({"DEPTH_ASSETS_DIR": f"{WEIGHTS_MOUNT}/marigold-v2-assets"})
 )
 
 # Hold fitting (jobs/hold_fit.py): differentiable SDF ray marching in plain torch.
@@ -158,7 +160,8 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 orchestrator = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install("prefect==3.9.3", "anthropic==2.8.0", "modal==1.6.4", "pyyaml", "boto3",
-                 "pydantic>=2.0", "numpy")
+                 "pydantic>=2.0", "numpy",
+                 "opencv-python-headless")   # benchmark renders (scripts/benchmark_set_of_marks.py)
     .env({"PREFECT_HOME": "/tmp/prefect", "PREFECT_SERVER_ALLOW_EPHEMERAL_MODE": "true"})
     .add_local_file(_REPO_ROOT / "configs" / "pipeline.yaml", "/root/configs/pipeline.yaml")
     .add_local_python_source("common", "jobs", "agents", "flows")

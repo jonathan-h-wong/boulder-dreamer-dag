@@ -64,7 +64,8 @@ STAGES: dict[str, Stage] = {s.name: s for s in [
 
     # --- dataset flow: scene perception ------------------------------------------
     _video("extract_bkg_plate", "modal",
-           deps=("raw_video",), config_keys=("downsampling.bkg_plate_rate",)),
+           deps=("raw_video",),
+           config_keys=("downsampling.bkg_plate_rate", "downsampling.bkg_plate_max_frames")),
     _video("extract_depth", "modal",
            deps=("raw_video",), config_keys=("downsampling.depth_rate", "models.moge3"),
            pins=("MOGE_REF",)),
@@ -75,10 +76,19 @@ STAGES: dict[str, Stage] = {s.name: s for s in [
     # --- dataset flow: hold perception (set-of-marks + geometric contacts) --------
     _video("extract_hold_proposals", "modal",
            deps=("extract_bkg_plate",),
-           config_keys=("hold_proposals", "models.sam2"), pins=("SAM2_REF",)),
+           config_keys=("hold_proposals", "models.sam2"), pins=("SAM2_REF",),
+           code=("jobs/extract_hold_proposals", "common/masks.py", "common/overlay.py")),
+    # two-pass set-of-marks: detect from per-mark close-ups, then describe at one scale
+    _video("detect_holds", "agent",
+           deps=("extract_hold_proposals",),
+           config_keys=("agents.detect_holds",),
+           code=("agents/detect_holds", "agents/base.py", "common/schemas.py",
+                 "common/proposals.py", "common/masks.py")),
     _video("extract_hold_descriptions", "agent",
-           deps=("extract_bkg_plate", "extract_hold_proposals"),
-           config_keys=("agents.extract_hold_descriptions",)),
+           deps=("extract_hold_proposals", "detect_holds"),
+           config_keys=("agents.extract_hold_descriptions",),
+           code=("agents/extract_hold_descriptions", "agents/base.py", "common/schemas.py",
+                 "common/proposals.py", "common/masks.py", "common/overlay.py")),
     _video("extract_hold_crops", "modal",
            deps=("extract_bkg_plate", "extract_hold_proposals", "extract_hold_descriptions"),
            config_keys=("models.marigold_v2",), pins=("MARIGOLD_V2_REF",)),

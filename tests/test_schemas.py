@@ -79,5 +79,37 @@ for label, payload in [
     except ValueError:
         check(f"coverage rejects {label}", True)
 
+# 4. Two-pass: detection coverage and the join with descriptions
+from agents.detect_holds.agent import resolve                      # noqa: E402
+from agents.extract_hold_descriptions.agent import join            # noqa: E402
+from common.schemas import (HoldDescriptionResponse, HoldDetectionResponse,   # noqa: E402
+                            HoldDetections)
+
+for model in (HoldDetectionResponse, HoldDescriptionResponse):
+    sch = output_config(model)["format"]["schema"]
+    check(f"{model.__name__}: strict schema", sch.get("additionalProperties") is False)
+ids = set(range(1, 101))
+det = resolve(HoldDetectionResponse(holds=[{"mark_ids": [2, 1, 999]}, {"mark_ids": [2, 3]}],
+                                    non_hold_marks=[3, 4] + list(range(5, 100))), ids, 0.02)
+check("resolve: unknown dropped, first hold keeps a repeated mark, skipped mark -> non-hold",
+      det.holds == [[1, 2], [3]] and det.unaccounted == [100] and 100 in det.non_hold_marks
+      and sorted([m for g in det.holds for m in g] + det.non_hold_marks) == sorted(ids))
+try:
+    resolve(HoldDetectionResponse(holds=[{"mark_ids": [1]}], non_hold_marks=list(range(2, 90))), ids, 0.02)
+    check("resolve: too many skipped marks fails the video", False)
+except ValueError:
+    check("resolve: too many skipped marks fails the video", True)
+dets = HoldDetections(holds=[[1, 3], [2]], non_hold_marks=[4])
+desc = {k: v for k, v in HOLD.items() if k != "mark_ids"}
+lab = join(dets, HoldDescriptionResponse(holds=[{**desc, "hold": 1}, {**desc, "hold": 2, "hold_type": "sloper"}]))
+check("join: fields matched by hold number, groups from detection",
+      [(h.mark_ids, h.hold_type.value) for h in lab.holds] == [([1, 3], HOLD["hold_type"]), ([2], "sloper")]
+      and lab.non_hold_marks == [4])
+try:
+    join(dets, HoldDescriptionResponse(holds=[{**desc, "hold": 1}]))
+    check("join: an undescribed detected hold fails the video", False)
+except ValueError:
+    check("join: an undescribed detected hold fails the video", True)
+
 print(f"\n{fails} failure(s)")
 sys.exit(1 if fails else 0)

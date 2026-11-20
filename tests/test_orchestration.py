@@ -29,12 +29,14 @@ mock = mock_aws()
 mock.start()
 
 import boto3
+import cv2
+import numpy as np
 from prefect.testing.utilities import prefect_test_harness
 
 import agents.base as base
-import agents.extract_hold_descriptions.agent as hold_agent
 import flows.runtime as runtime
 from common.idempotency import write_marker
+from common.masks import encode_masks
 from flows.dataset_flow import dataset_flow
 from flows.filter_flow import filter_flow
 
@@ -91,13 +93,18 @@ class FakeFn:
         if self.stage == "extract_bkg_plate":
             s3.put_object(Bucket=BUCKET, Key=f"processed/{vid}/bkg_rgb.png", Body=b"png")
         if self.stage == "extract_hold_proposals":
-            marks = {"image_size": [100, 100], "marks": {
-                "1": {"bbox": [0, 0, 10, 10], "area": 80, "centroid": [5, 5]},
-                "2": {"bbox": [5, 5, 30, 20], "area": 200, "centroid": [15, 12]},
-                "3": {"bbox": [50, 50, 60, 60], "area": 90, "centroid": [55, 55]}}}
-            s3.put_object(Bucket=BUCKET, Key=f"processed/{vid}/holds/proposals/marks.json",
-                          Body=json.dumps(marks).encode())
-            s3.put_object(Bucket=BUCKET, Key=f"processed/{vid}/holds/proposals/tiles/00.png", Body=b"png")
+            marks = {"image_size": [100, 100], "overlay_size": [200, 200], "tiles": [[0, 0, 200, 200]],
+                     "marks": {
+                "1": {"bbox": [0, 0, 10, 10], "area": 80, "centroid": [5, 5], "label_point": [10, 10]},
+                "2": {"bbox": [5, 5, 30, 20], "area": 200, "centroid": [15, 12], "label_point": [30, 24]},
+                "3": {"bbox": [50, 50, 60, 60], "area": 90, "centroid": [55, 55], "label_point": [110, 110]}}}
+            crops = {int(k): np.ones((m["bbox"][3] - m["bbox"][1], m["bbox"][2] - m["bbox"][0]), bool)
+                     for k, m in marks["marks"].items()}
+            base_key = f"processed/{vid}/holds/proposals/"
+            s3.put_object(Bucket=BUCKET, Key=base_key + "marks.json", Body=json.dumps(marks).encode())
+            s3.put_object(Bucket=BUCKET, Key=base_key + "masks.npz", Body=encode_masks(crops))
+            s3.put_object(Bucket=BUCKET, Key=base_key + "plate.jpg",
+                          Body=cv2.imencode(".jpg", np.full((100, 100, 3), 128, np.uint8))[1].tobytes())
         if self.stage == "post_processing":
             for sub in ("input/wall_mesh.glb", "output/scenegraph.json", "output/poses.npy"):
                 s3.put_object(Bucket=BUCKET, Key=f"processed/{vid}/{sub}", Body=b"x")
@@ -145,12 +152,14 @@ class FakeBatches:
     def results(self, bid):
         for r in self.batches[bid]:
             schema = r["params"]["output_config"]["format"]["schema"]
-            if "holds" in schema["properties"]:   # HoldLabelResponse
-                hold = {"mark_ids": [2, 1], "hold_type": "jug", "outline": "oval",
+            if "non_hold_marks" in schema["properties"]:   # HoldDetectionResponse
+                text = json.dumps({"holds": [{"mark_ids": [2, 1]}], "non_hold_marks": [3]})
+            elif "holds" in schema["properties"]:          # HoldDescriptionResponse
+                hold = {"hold": 1, "hold_type": "jug", "outline": "oval",
                         "profile": "convex_dome", "lip": "incut", "opening": "hand_scoop",
                         "symmetry": "bilateral", "relative_size": "medium",
                         "depth_class": "deep", "description": "Big jug."}
-                text = json.dumps({"holds": [hold], "non_hold_marks": [3]})
+                text = json.dumps({"holds": [hold]})
             else:                                  # FilterJudgment
                 text = json.dumps({"too_many_climbers": False, "camera_blur": False,
                                    "moving_camera": False, "no_floor_plane": False, "notes": ""})
@@ -335,6 +344,17 @@ with prefect_test_harness():
     check("hold records: code-assigned id, merged marks, union bbox",
           len(rows) == 1 and rows[0]["hold_id"] == "h000" and json.loads(rows[0]["mark_ids"]) == [1, 2]
           and json.loads(rows[0]["bbox"]) == [0, 0, 30, 20] and rows[0]["on_route"] == "")
+    det = json.loads(s3.get_object(Bucket=BUCKET, Key="processed/v1/holds/hold_detections.json")["Body"].read())
+    check("two-pass: detections written, every mark once", det["holds"] == [[1, 2]] and det["non_hold_marks"] == [3])
+    reqs = [r["params"] for b in fake.messages.batches.batches.values() for r in b]
+    n_img = lambda p: sum(1 for c in p["messages"][0]["content"] if c["type"] == "image")
+    det_req = next(p for p in reqs if "non_hold_marks" in p["output_config"]["format"]["schema"]["properties"])
+    desc_req = next(p for p in reqs if "hold" in json.dumps(p["output_config"]["format"]["schema"])
+                    and "non_hold_marks" not in p["output_config"]["format"]["schema"]["properties"]
+                    and "holds" in p["output_config"]["format"]["schema"]["properties"])
+    check("detection request: plate + one close-up per mark", n_img(det_req) == 1 + 3)
+    check("description request: plate + (overlay, clean) per tile, lists the detected hold",
+          n_img(desc_req) == 1 + 2 and "hold 1: regions 1, 2" in desc_req["messages"][0]["content"][-1]["text"])
     req = fake.messages.batches.batches["msgbatch_1"][0]["params"]
     check("filter request carries structured-output schema + effort",
           req["output_config"]["format"]["type"] == "json_schema"
@@ -353,6 +373,17 @@ with prefect_test_harness():
           sorted(o["Key"] for o in s3.list_objects_v2(Bucket=BUCKET, Prefix="state/")["Contents"]) == ["state/kaya/gyms.csv"]
           and all(o["Key"].startswith(("raw/videos/", "raw/metadata/"))
                   for o in s3.list_objects_v2(Bucket=BUCKET, Prefix="raw/")["Contents"]))
+
+    # 10. stage selection: run only the requested stages, even though later ones go stale
+    config["downsampling"]["bkg_plate_max_frames"] = 32; write_cfg(); calls.clear()
+    created_before = fake.messages.batches.created
+    dataset_flow(config_path=str(CFG), stages=["extract_bkg_plate", "extract_hold_proposals"])
+    check("stages=[plate, proposals]: runs exactly those, no Claude batch, nothing downstream",
+          set(s for s, _ in calls) == {"extract_bkg_plate", "extract_hold_proposals"}
+          and fake.messages.batches.created == created_before)
+    calls.clear()
+    dataset_flow(config_path=str(CFG), stages=["extract_hold_proposals"], sample=1, seed=0)
+    check("stages + sample: one video, already current -> nothing runs", not calls)
 
 print(f"\n{failures} failure(s)")
 sys.exit(1 if failures else 0)

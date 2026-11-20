@@ -14,6 +14,7 @@ s3:
     processed: "processed/"
     manifests: "manifests/"              # immutable dataset releases ({release}.json)
     batches: "_batches/"                 # in-flight Claude batch records (resume on rerun)
+    benchmarks: "_benchmarks/"           # model comparisons (scripts/benchmark_*.py)
 
 filter:
   n_frames: 8                    # evenly spaced frames sent to the filter agent
@@ -25,6 +26,7 @@ filter:
 downsampling:
   # Aggressive downsampling for background plate and hold detection
   bkg_plate_rate: 10             # every Nth frame for per-video bkg plate
+  bkg_plate_max_frames: 64       # stride grows past bkg_plate_rate to stay under this
   depth_rate: 5                  # every Nth frame for depth sampling
   keypose_rate: 1                # full sequence (GVHMR runs on all frames)
 
@@ -43,10 +45,15 @@ models:
     resolution: 1024                            # 2048 needs a ~32 GB GPU
 
 hold_proposals:                  # SAM2 automatic masks -> numbered set-of-marks overlay
+  max_side_px: 1920              # SAM2 + overlay resolution (only 4K plates are downscaled)
   points_per_side: 64
   crop_n_layers: 1               # extra zoomed passes so small footholds survive
-  min_mask_area_px: 150
+  pred_iou_thresh: 0.8           # SAM2 defaults; lower both to raise recall
+  stability_score_thresh: 0.95
+  min_mask_area_px: 150          # at max_side_px resolution
+  max_mask_area_frac: 0.2        # drop wall / floor / mat-sized masks
   nms_mask_iou: 0.7
+  overlay_long_side_px: 2560     # overlay upscaled to this; labels stay a fixed pixel size
   tile_px: 1024                  # overlay tiles sent to the agent (API downscales big images)
   tile_overlap_px: 128
 
@@ -74,10 +81,21 @@ agents:                          # one section per agent stage; each stage hashe
     model: "claude-haiku-5-5"
     effort: "low"                # thinking depth; 5.5 models think adaptively, effort is the dial
     max_tokens: 4000             # truncation = failure (retried next run)
-  extract_hold_descriptions:     # set-of-marks labeling; model pending the benchmark
-    model: "claude-opus-5-5"
+  # Set-of-marks hold perception, two passes. Haiku with this split beat Haiku single-pass
+  # on detection and type agreement with Opus at ~1/15th of Opus' cost (scratch experiments
+  # against the Opus-high reference, 20 plates, Nov 2026).
+  detect_holds:                  # pass 1: one close-up per proposal -> which marks are holds
+    model: "claude-haiku-5-5"
     effort: "medium"
-    max_tokens: 16000            # room for thinking + a full hold list
+    max_tokens: 16000
+    closeup_px: 224              # each close-up's side; shown twice (photo | outlined)
+    closeup_scale: 2.0           # window = 2x the mark's larger bbox side...
+    closeup_min_px: 64           # ...but at least this many plate.jpg px
+    max_missing_frac: 0.02       # skipped marks above this fraction fail the video (retried)
+  extract_hold_descriptions:     # pass 2: whole plate at one scale -> fields per detected hold
+    model: "claude-haiku-5-5"
+    effort: "medium"
+    max_tokens: 32000            # room for thinking + a description per hold (up to ~170)
   curate_hold_catalog:           # one shape-program request per cluster: hardest, fewest calls
     model: "claude-opus-5-5"
     effort: "high"

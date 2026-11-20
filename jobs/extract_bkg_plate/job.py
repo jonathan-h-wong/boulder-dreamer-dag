@@ -12,6 +12,7 @@ app = modal.App(app_name("extract_bkg_plate"))
     image=cpu_base,
     secrets=SECRETS,
     cpu=4,
+    memory=8192,      # 64 frames of 4K + the median's working copy
     timeout=900,
 )
 def extract_bkg_plate(video_id: str, marker: dict, config: dict):

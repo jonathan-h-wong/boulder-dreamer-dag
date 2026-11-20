@@ -1,68 +1,106 @@
 """
-Hold description agent (set-of-marks) — one Claude batch request per video, dispatched
-together by agents.base.run_batch_stage. Its output also feeds the global hold catalog.
+Hold description agent (set-of-marks, pass 2 of 2) — one Claude batch request per video,
+dispatched together by agents.base.run_batch_stage. Its output also feeds the global hold
+catalog.
 
-Input (from extract_hold_proposals):
-  processed/{video_id}/bkg_rgb.png
-  processed/{video_id}/holds/proposals/marks.json
-      {"image_size": [w, h], "marks": {"<mark_id>": {"bbox": [x0, y0, x1, y1], "area": int,
-                                                     "centroid": [x, y]}}}
-  processed/{video_id}/holds/proposals/tiles/*.png   (numbered overlay tiles)
+detect_holds already decided which marks are holds and how they group; this pass judges
+the fields for each detected hold with the whole wall at one scale: the clean plate plus
+the standard overlay tiles (marks.json "tiles", overlay px), redrawn with only the detected
+holds outlined, one number per hold (its smallest mark id, at its largest mark's label
+point), each tile followed by the same tile without outlines.
+
+Input:
+  processed/{video_id}/holds/proposals/{plate.jpg, marks.json, masks.npz}
+  processed/{video_id}/holds/hold_detections.json     (detect_holds)
 Output:
-  processed/{video_id}/holds/hold_labels.json        validated HoldLabelResponse (raw judgment)
+  processed/{video_id}/holds/hold_labels.json        HoldLabelResponse: detections joined
+                                                     with descriptions
   processed/{video_id}/holds/hold_descriptions.csv   HoldRecord rows; hold_id and bbox are
                                                      computed here from the marks, on_route /
                                                      mounted_on stay empty (extract_hold_contacts
                                                      writes those to hold_contacts.csv)
+Every detected hold must be described (a truncated answer fails the video, retried next run).
 """
 
-import base64
+from __future__ import annotations
+
 import csv
 import io
 import json
 
-from agents.base import output_config, parse_structured
+import cv2
+import numpy as np
+
+from agents.base import image_block, output_config, parse_structured
 from agents.extract_hold_descriptions.prompts import SYSTEM_PROMPT, build_hold_description_prompt
-from common.s3 import download_bytes, get_client, list_keys
-from common.schemas import HoldLabelResponse, HoldRecord
+from common.overlay import paste_marks, render_overlay
+from common.proposals import load_proposals
+from common.s3 import download_bytes, get_client
+from common.schemas import (HoldDescriptionResponse, HoldDetections, HoldLabel, HoldLabelResponse,
+                            HoldRecord)
 
 
 def _holds_prefix(video_id: str, config: dict) -> str:
     return f"{config['s3']['prefixes']['processed']}{video_id}/holds/"
 
 
-def _load_marks(video_id: str, config: dict) -> dict[int, dict]:
+def load_detections(video_id: str, config: dict) -> HoldDetections:
     s3 = get_client(config["s3"]["region"])
-    raw = download_bytes(s3, config["s3"]["bucket"], _holds_prefix(video_id, config) + "proposals/marks.json")
-    return {int(k): v for k, v in json.loads(raw)["marks"].items()}
+    return HoldDetections.model_validate_json(download_bytes(
+        s3, config["s3"]["bucket"], _holds_prefix(video_id, config) + "hold_detections.json"))
 
 
-def _image_block(data: bytes, media_type: str = "image/png") -> dict:
-    return {"type": "image", "source": {"type": "base64", "media_type": media_type,
-                                        "data": base64.b64encode(data).decode()}}
+def detected_overlay_tiles(marks: dict, masks: dict[int, np.ndarray], plate_jpg: bytes,
+                           holds: list[list[int]]) -> list[tuple[bytes, bytes]]:
+    """[(overlay tile PNG, clean tile JPEG)] over marks["tiles"], only detected holds drawn."""
+    plate = cv2.imdecode(np.frombuffer(plate_jpg, np.uint8), cv2.IMREAD_COLOR)
+    ow, oh = marks["overlay_size"]
+    u = ow / marks["image_size"][0]                     # plate px -> overlay px
+    big = cv2.resize(plate, (ow, oh), interpolation=cv2.INTER_CUBIC)
+    regions = []
+    for g in holds:
+        bbox, crop = paste_marks(marks["marks"], masks, g, u)
+        biggest = max(g, key=lambda m: marks["marks"][str(m)]["area"])
+        regions.append((g[0], {"bbox": bbox, "crop": crop,
+                               "label_point": tuple(marks["marks"][str(biggest)]["label_point"])}))
+    overlay = render_overlay(big, regions)
+    return [(cv2.imencode(".png", overlay[y0:y1, x0:x1])[1].tobytes(),
+             cv2.imencode(".jpg", big[y0:y1, x0:x1], [int(cv2.IMWRITE_JPEG_QUALITY), 92])[1].tobytes())
+            for x0, y0, x1, y1 in marks["tiles"]]
 
 
-def build_params(video_id: str, config: dict) -> dict:
-    s3 = get_client(config["s3"]["region"])
-    bucket = config["s3"]["bucket"]
-    marks = _load_marks(video_id, config)
-    tile_keys = sorted(k for k in list_keys(s3, bucket, _holds_prefix(video_id, config) + "proposals/tiles/")
-                       if k.endswith(".png"))
-    if not tile_keys:
-        raise FileNotFoundError(f"no overlay tiles for {video_id}")
-    plate = download_bytes(s3, bucket, f"{config['s3']['prefixes']['processed']}{video_id}/bkg_rgb.png")
-
-    content = [_image_block(plate)]
-    content += [_image_block(download_bytes(s3, bucket, k)) for k in tile_keys]
-    content.append({"type": "text",
-                    "text": build_hold_description_prompt(video_id, len(marks), len(tile_keys))})
+def build_request(video_id: str, marks: dict, masks: dict[int, np.ndarray], plate_jpg: bytes,
+                  detections: HoldDetections, config: dict) -> dict:
+    """Messages API params from loaded proposals + detections (also used by the benchmark)."""
+    cfg = config["agents"]["extract_hold_descriptions"]
+    holds = sorted((sorted(g) for g in detections.holds), key=min)
+    if not holds:
+        raise ValueError("no detected holds to describe")
+    tiles = detected_overlay_tiles(marks, masks, plate_jpg, holds)
+    content = [image_block(plate_jpg, "image/jpeg")]
+    for overlay_png, clean_jpg in tiles:
+        content += [image_block(overlay_png), image_block(clean_jpg, "image/jpeg")]
+    content.append({"type": "text", "text": build_hold_description_prompt(video_id, len(tiles), holds)})
     return {
-        "model": config["agents"]["extract_hold_descriptions"]["model"],
-        "max_tokens": config["agents"]["extract_hold_descriptions"]["max_tokens"],
+        "model": cfg["model"],
+        "max_tokens": cfg["max_tokens"],
         "system": SYSTEM_PROMPT,
         "messages": [{"role": "user", "content": content}],
-        "output_config": output_config(HoldLabelResponse, config["agents"]["extract_hold_descriptions"].get("effort")),
+        "output_config": output_config(HoldDescriptionResponse, cfg.get("effort")),
     }
+
+
+def join(detections: HoldDetections, resp: HoldDescriptionResponse) -> HoldLabelResponse:
+    """One HoldLabel per detected hold; raises if any detected hold went undescribed."""
+    by_number: dict[int, dict] = {}
+    for d in resp.holds:
+        by_number.setdefault(d.hold, d.model_dump(exclude={"hold"}))   # first entry wins
+    holds = [sorted(g) for g in detections.holds]
+    missing = [g[0] for g in holds if g[0] not in by_number]
+    if missing:
+        raise ValueError(f"{len(missing)} of {len(holds)} detected holds not described: {missing[:10]}")
+    return HoldLabelResponse(holds=[HoldLabel(mark_ids=g, **by_number[g[0]]) for g in holds],
+                             non_hold_marks=detections.non_hold_marks)
 
 
 def _union_bbox(boxes: list[list[int]]) -> list[int]:
@@ -97,9 +135,15 @@ def records_to_csv(records: list[HoldRecord]) -> str:
     return buf.getvalue()
 
 
+def build_params(video_id: str, config: dict) -> dict:
+    marks, masks, plate_jpg = load_proposals(video_id, config)
+    return build_request(video_id, marks, masks, plate_jpg, load_detections(video_id, config), config)
+
+
 def handle_result(video_id: str, message, config: dict) -> None:
-    labels = parse_structured(message, HoldLabelResponse)
-    records = build_records(labels, _load_marks(video_id, config))
+    labels = join(load_detections(video_id, config), parse_structured(message, HoldDescriptionResponse))
+    marks, _, _ = load_proposals(video_id, config, masks=False, plate=False)
+    records = build_records(labels, {int(k): v for k, v in marks["marks"].items()})
 
     s3 = get_client(config["s3"]["region"])
     bucket, prefix = config["s3"]["bucket"], _holds_prefix(video_id, config)
@@ -107,4 +151,4 @@ def handle_result(video_id: str, message, config: dict) -> None:
                   Body=labels.model_dump_json(indent=2).encode(), ContentType="application/json")
     s3.put_object(Bucket=bucket, Key=prefix + "hold_descriptions.csv",
                   Body=records_to_csv(records).encode(), ContentType="text/csv")
-    print(f"[{video_id}] {len(records)} holds, {len(labels.non_hold_marks)} non-hold marks")
+    print(f"[{video_id}] {len(records)} holds described, {len(labels.non_hold_marks)} non-hold marks")

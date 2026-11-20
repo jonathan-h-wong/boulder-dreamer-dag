@@ -18,6 +18,7 @@ handle_result raising marks that item failed; it's retried on the next run.
 
 from __future__ import annotations
 
+import base64
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -42,6 +43,11 @@ IO_WINDOW = 256          # items in flight at once (bounds request memory)
 def get_client() -> anthropic.Anthropic:
     # API key from ANTHROPIC_API_KEY (Modal secret / orchestrator env)
     return anthropic.Anthropic()
+
+
+def image_block(data: bytes, media_type: str = "image/png") -> dict:
+    return {"type": "image", "source": {"type": "base64", "media_type": media_type,
+                                        "data": base64.b64encode(data).decode()}}
 
 
 def message_text(message) -> str:
